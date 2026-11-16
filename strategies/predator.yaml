@@ -1,0 +1,44 @@
+# Source: Predator.xml (Deriv DBot Blockly). Reproduced, not modified.
+key: predator
+name: Predator
+source_file: Predator.xml
+original:
+  market: synthetic_index
+  submarket: random_index
+  symbol: 1HZ10V
+  trade_type: digits / overunder (DIGITOVER)
+  restart_on_error: true
+  restart_buy_sell_on_error: false
+
+legs:
+  - id: main
+    description: "Before purchase: MA = SMA(ticks, 8); if tick < MA only notify 'DOWN TREND', else purchase DIGITOVER."
+    contract_type: DIGITOVER
+    barrier: 3
+    duration_ticks: 1
+    trigger: {type: price_vs_sma, period: 8, op: gte}
+    trigger_text: "last price ≥ SMA(8) of the last 8 tick prices"
+    compare_to: complement     # audit: SMA-true WR must beat SMA-false WR
+
+sequence:
+  steps: [main]
+  on_win: reset
+  on_loss: advance
+  overflow: hold_last
+
+stake:
+  model: multiply
+  base: 1.0
+  factor: 3.0
+  text: "On loss: stake += |contract profit| x MartingaleFactor(2)  (x3). On win: stake = initialStake (1)."
+
+take_profit: 10
+stop_loss: null
+stop_loss_text: "No stop-loss. Trading continues while total_profit < 10."
+
+non_purchase_logic:
+  - "tick_analysis only notifies 'AmountLoss' (a variable that is never updated)."
+  - "The Report procedure only builds a notification (TotalProfit / LowestBalance / LowestLoss)."
+known_issues:
+  - "No stop-loss: 6 losses in a row lose 364 at base stake 1; 8 lose 3,280."
+  - "Report figures are unreliable (TotalProfit/LowestBalance start undefined); trading is not affected."

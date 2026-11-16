@@ -1,0 +1,42 @@
+# Source: Delta.xml (Deriv DBot Blockly). Reproduced, not modified.
+key: delta
+name: Delta
+source_file: Delta.xml
+original:
+  market: synthetic_index
+  submarket: random_index
+  symbol: R_10
+  trade_type: digits / overunder (DIGITOVER)
+  restart_on_error: true
+  restart_buy_sell_on_error: false
+
+legs:
+  - id: main
+    description: "Before purchase: if last_digit == 1 then purchase DIGITOVER (prediction PREDIKSI = 3, duration 2 ticks)."
+    contract_type: DIGITOVER
+    barrier: 3
+    duration_ticks: 2
+    trigger: {type: last_digit_in, digits: [1]}
+    trigger_text: "last digit = 1"
+    compare_to: unconditional   # audit: trigger WR must be above the unconditional WR
+
+sequence:
+  steps: [main]
+  on_win: reset
+  on_loss: advance
+  overflow: hold_last
+
+stake:
+  model: multiply
+  base: 0.5
+  factor: 2.5
+  text: "On loss: Initial Stake += |profit x MARTI(1.5)| (x2.5). On win: Initial Stake = STAKE_MODAL (0.5)."
+
+take_profit: 5
+stop_loss: 50
+stop_loss_text: "After every contract: stop if total_profit is negative and |total_profit| >= 50, or total_profit >= 5."
+
+non_purchase_logic:
+  - "tick_analysis: check_direction rise/fall and candle colour (is_candle_black) only print 'UP/DOWN · CANDLE HIJAU/MERAH' notifications."
+known_issues:
+  - "Stop-loss 50 is breached on the 6th consecutive loss (-81.05)."

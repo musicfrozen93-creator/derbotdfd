@@ -1,0 +1,51 @@
+# Source: Navix.xml (Deriv DBot Blockly). Reproduced, not modified.
+key: navix
+name: Navix
+source_file: Navix.xml
+original:
+  market: volidx (older name of synthetic_index)
+  submarket: random_index
+  symbol: R_100
+  trade_type: digits / overunder (contract type "both")
+  restart_on_error: true
+  restart_buy_sell_on_error: false
+
+legs:
+  - id: base
+    description: "If last_digit == 4 AND stake == 0.6 (not in recovery): purchase DIGITUNDER with Predict = 8."
+    contract_type: DIGITUNDER
+    barrier: 8
+    duration_ticks: 1
+    trigger: {type: last_digit_in, digits: [4]}
+    trigger_text: "last digit = 4 (base mode, stake = 0.6)"
+    compare_to: unconditional
+  - id: recovery
+    description: "If last_digit == 6 AND stake > 0.6 (after a loss): purchase DIGITOVER with Predict = 2."
+    contract_type: DIGITOVER
+    barrier: 2
+    duration_ticks: 1
+    trigger: {type: last_digit_in, digits: [6]}
+    trigger_text: "last digit = 6 (recovery mode, stake > 0.6)"
+    compare_to: unconditional
+
+sequence:
+  steps: [base, recovery]
+  on_win: reset       # stake = 0.6, Predict = 8
+  on_loss: advance    # stake x 3.5, Predict = 2
+  overflow: hold_last
+
+stake:
+  model: multiply
+  base: 0.6
+  factor: 3.5
+  text: "On loss: stake = stake x 3.5, Predict = 2. On win: stake = 0.6, Predict = 8."
+
+take_profit: null
+stop_loss: null
+stop_loss_text: "None. 'target' is increased by each profit but never checked; the bot runs until stopped."
+
+non_purchase_logic:
+  - "Report2 procedure only maintains display statistics."
+known_issues:
+  - "No take-profit or stop-loss at all; 7th stake after 6 losses is 1,102.96."
+  - "The loss-branch updates (stake, Predict) sit inside a 0-second timeout block while trade_again runs right after it; whether DBot re-reads the trade options before or after the timeout fires needs a demo-account check."

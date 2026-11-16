@@ -1,0 +1,44 @@
+# Source: Voltrix.xml (Deriv DBot Blockly). Reproduced, not modified.
+key: voltrix
+name: Voltrix
+source_file: Voltrix.xml
+original:
+  market: synthetic_index
+  submarket: random_index
+  symbol: R_100
+  trade_type: digits / overunder (DIGITOVER)
+  restart_on_error: false
+  restart_buy_sell_on_error: false
+
+legs:
+  - id: main
+    description: "Before purchase: notify the loss counter, then purchase DIGITOVER. Prediction is hard-coded 7, duration 3 ticks."
+    contract_type: DIGITOVER
+    barrier: 7
+    duration_ticks: 3
+    trigger: {type: every_tick}
+    trigger_text: "none — buys on every tick (only the 3rd tick's digit settles the contract)"
+
+sequence:
+  steps: [main]
+  on_win: reset
+  on_loss: advance
+  overflow: hold_last
+
+stake:
+  model: multiply
+  base: 0.37
+  factor: 1.3
+  flat_losses: 4
+  text: "Flat 0.37 for the first 4 losses in a row; from the 5th loss on, stake += |loss| x 0.3 (x1.3). On win: 0.37."
+
+take_profit: 5
+stop_loss: 500
+stop_loss_text: "After every contract: stop if total_profit >= 5, or if total_profit is negative and |total_profit| >= 500."
+
+non_purchase_logic:
+  - "A 'Prediction' variable (set to 2) is never used; the contract is hard-coded OVER 7."
+  - "'Time' variable (3) is never used; duration is the literal 3."
+  - "tick_analysis only shows the last digit."
+known_issues:
+  - "20% win contract: 4 losses in a row happen about 1 in 2.4 sequences; the ladder grows slowly so the 500 stop-loss is far away."

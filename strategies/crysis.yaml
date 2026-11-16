@@ -1,0 +1,53 @@
+# Source: Crysis.xml (Deriv DBot Blockly). Reproduced, not modified.
+key: crysis
+name: Crysis
+source_file: Crysis.xml
+original:
+  market: volidx (older name of synthetic_index)
+  submarket: random_index
+  symbol: R_10
+  trade_type: digits / overunder (contract type "both")
+  restart_on_error: false
+  restart_buy_sell_on_error: true
+
+legs:
+  - id: main
+    description: >-
+      tick_analysis shifts the last 7 digits into X1..X7 (X1 = current last digit) and counts X = number of
+      X1..X7 below 4. Before purchase: if X > 3 AND X1 > 4 then purchase DIGITOVER 3, duration 5 ticks.
+    contract_type: DIGITOVER
+    barrier: 3
+    duration_ticks: 5
+    trigger:
+      type: all_of
+      conditions:
+        - {type: window_digit_count, window: 7, digits: [0, 1, 2, 3], min_count: 4}
+        - {type: last_digit_in, digits: [5, 6, 7, 8, 9]}
+    trigger_text: "≥4 of the last 7 digits in 0–3 AND last digit ≥ 5"
+    compare_to: unconditional
+
+sequence:
+  steps: [main]
+  on_win: reset
+  on_loss: advance
+  overflow: hold_last
+
+stake:
+  model: crysis
+  base: 0.35
+  steady_state_y: 0
+  text: >-
+    On loss: Y = Y + |loss|; stake = 2 x Y (about x3 per loss). On a win after losses: stake = Initial X.
+    On a clean win (Y = 0): stake += profit (compounding), reset to 0.35 if stake > balance / 1300. Then Y = 0.
+
+take_profit: 3
+stop_loss: null
+stop_loss_text: "No stop-loss. Stops when its own profit counter (svoy_profit) reaches 3."
+
+non_purchase_logic:
+  - "The tick_analysis notification ('X: .. X1: ..') is display only; X and X1 themselves ARE the entry filter."
+known_issues:
+  - "Initial Y starts at 2 instead of 0: the first-ever loss jumps the stake from 0.35 to 4.70. The ladder here uses the steady state (Y = 0)."
+  - "X1..X7 start as null and JavaScript treats null < 4 as true, so the first 7 ticks after start over-count low digits. History replay is unaffected."
+  - "Compounding after clean wins depends on the account balance, which the analyzer does not know."
+  - "tick_analysis and before_purchase both run per tick; their order inside DBot is assumed (same tick) and should be confirmed on a demo account."

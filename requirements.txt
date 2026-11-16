@@ -1,0 +1,6 @@
+websockets>=13.0,<17
+numpy>=1.26
+scipy>=1.11
+PyYAML>=6.0
+python-dotenv>=1.0
+tzdata>=2024.1

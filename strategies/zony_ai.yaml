@@ -1,0 +1,46 @@
+# Source: Zony AI.xml (Deriv DBot Blockly). Reproduced, not modified.
+key: zony_ai
+name: Zony AI
+source_file: Zony AI.xml
+original:
+  market: synthetic_index
+  submarket: random_index
+  symbol: 1HZ50V
+  trade_type: digits / overunder (contract type "both")
+  restart_on_error: true
+  restart_buy_sell_on_error: false
+
+# Trade options run "currentPrediction += 1" then prediction = predictionList[currentPrediction]
+# (1-based) with predictionList = [0, 4, 5, 6, 7, 8]. A win sets currentPrediction = 0.
+legs:
+  - {id: step1, contract_type: DIGITOVER, barrier: 0, duration_ticks: 1, trigger: {type: every_tick},
+     trigger_text: "none — buys on every tick", description: "fresh / after a win"}
+  - {id: step2, contract_type: DIGITOVER, barrier: 4, duration_ticks: 1, trigger: {type: every_tick},
+     trigger_text: "none — buys on every tick", description: "after 1 loss"}
+  - {id: step3, contract_type: DIGITOVER, barrier: 5, duration_ticks: 1, trigger: {type: every_tick},
+     trigger_text: "none — buys on every tick", description: "after 2 losses"}
+  - {id: step4, contract_type: DIGITOVER, barrier: 6, duration_ticks: 1, trigger: {type: every_tick},
+     trigger_text: "none — buys on every tick", description: "after 3 losses"}
+  - {id: step5, contract_type: DIGITOVER, barrier: 7, duration_ticks: 1, trigger: {type: every_tick},
+     trigger_text: "none — buys on every tick", description: "after 4 losses"}
+  - {id: step6, contract_type: DIGITOVER, barrier: 8, duration_ticks: 1, trigger: {type: every_tick},
+     trigger_text: "none — buys on every tick", description: "after 5 losses"}
+
+sequence:
+  steps: [step1, step2, step3, step4, step5, step6]
+  on_win: reset
+  on_loss: advance
+  overflow: error_reset    # 7th step reads index 7 of a 6-item list -> undefined prediction -> DBot error
+
+stake:
+  model: flat
+  base: 1.0
+  text: "Flat stake 1; the prediction steps up instead after each loss."
+
+take_profit: null
+stop_loss: null
+stop_loss_text: "None."
+
+non_purchase_logic: []
+known_issues:
+  - "After 6 straight losses the prediction becomes undefined and DBot errors; 'Restart on error' is on, so behaviour after that point needs a demo-account check (the replay assumes a restart from step 1)."

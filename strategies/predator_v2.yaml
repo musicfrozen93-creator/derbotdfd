@@ -1,0 +1,43 @@
+# Source: Predator v2.xml (Deriv DBot Blockly). Reproduced, not modified.
+key: predator_v2
+name: Predator v2
+source_file: Predator v2.xml
+original:
+  market: synthetic_index
+  submarket: random_index
+  symbol: R_100
+  trade_type: digits / overunder (contract type "both")
+  restart_on_error: true
+  restart_buy_sell_on_error: false
+
+legs:
+  - id: main
+    description: "Before purchase: purchase DIGITOVER unconditionally."
+    contract_type: DIGITOVER
+    barrier: 5
+    duration_ticks: 1
+    trigger: {type: every_tick}
+    trigger_text: "none — buys on every tick"
+
+sequence:
+  steps: [main]
+  on_win: reset
+  on_loss: advance
+  overflow: hold_last
+
+stake:
+  model: multiply
+  base: 2.0
+  factor: 2.0
+  reset_if_single_loss_gte: 1000
+  text: "On loss: Stake += |contract profit| x 1 (x2); if that single loss >= 1000, Stake = 2. On win: Stake = 2."
+
+take_profit: 607
+stop_loss: null
+stop_loss_text: "No running stop-loss. The 'Loss' variable (1000) is compared with one contract's loss, not the total."
+
+non_purchase_logic:
+  - "Two disabled orphan blocks (number 5, text 'Expert  Speed Bot') have no effect."
+known_issues:
+  - "No real stop-loss: the stake only resets after a single losing stake of 1,024 (10th loss in a row)."
+  - "40% win contract doubled after every loss: 6 losses in a row about once every 21 base entries."

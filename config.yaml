@@ -1,0 +1,105 @@
+# Deriv Market Condition Analyzer — configuration
+# Secrets (Telegram token / chat id) go in .env, never here.
+
+deriv:
+  # Public, read-only WebSocket (verified live 2026-11-16). No API token is used.
+  ws_url: wss://api.derivws.com/trading/v1/options/ws/public
+  request_timeout_s: 30
+  open_timeout_s: 20
+  ping_interval_s: 30            # app-level {"ping": 1}
+  idle_reconnect_s: 60           # reconnect if nothing at all is received for this long
+  reconnect_backoff_min_s: 1
+  reconnect_backoff_max_s: 60
+  rate_limit_general_per_min: 150   # Deriv docs: 220/min shared by non-proposal calls
+  rate_limit_proposal_per_min: 30   # quotes only; live test 2026-11-16 hit RateLimit at ~80 quotes in <30 s
+
+discovery:
+  interval_minutes: 360          # re-run active_symbols + contracts_for every 6 h
+  markets: [synthetic_index]     # Deriv "market" values to consider
+  include_submarkets: []         # empty = every submarket; contracts_for decides compatibility
+  exclude_symbols: []
+  priority_symbols: [R_100, R_10, 1HZ10V, 1HZ50V]   # the bots' original symbols are served first
+  max_symbols: 40
+
+collection:
+  flush_interval_s: 1.0
+  bootstrap_target_ticks: 400000  # history fetched per symbol on first start (~4.6 days at 1 tick/s)
+  bootstrap_max_days: 14
+  history_page_size: 1000         # the public API returns at most 1,000 ticks per request
+  gap_audit_interval_minutes: 10
+  gap_audit_lookback_hours: 6
+  retention_days: 30
+
+data_quality:
+  gap_factor: 10                 # gap = interval > 10 x nominal (10 s on 1s indices, 20 s on 2 s indices)
+  missing_factor: 1.5            # live "missing tick" log threshold
+  stale_factor: 10
+  critical_stale_s: 120          # no ticks for this long -> FAULT -> critical alert + immediate STOP
+  critical_disconnect_s: 120
+  clean_window_minutes: 30       # START requires a clean last 30 minutes
+  chi2_window: 5000
+  chi2_fault_p: 0.001
+
+analysis:
+  interval_s: 60
+  max_ticks: 400000              # ticks per symbol kept in memory for replay
+  oos_fraction: 0.3              # newest 30% of the window = out-of-sample confirmation block
+  min_ticks: 20000               # audit: INSUFFICIENT DATA below 20,000 stored ticks
+  min_trigger_events: 2000       # audit: INSUFFICIENT DATA below 2,000 trigger events
+  min_trials_run: 20000          # audit: RUN CANDIDATE needs >= 20,000 discovery trials
+  min_oos_trials: 5000
+  confidence: 0.95
+  fdr_q: 0.05                    # Benjamini–Hochberg false-discovery rate
+  oos_alpha: 0.05
+  stability_recent: 1000         # most recent trigger events ...
+  stability_prior: 4000          # ... compared with the 4,000 before them
+  stability_alpha: 0.01
+  runs_alpha: 0.01
+  latency_robustness: true       # edge must also hold if settlement slips one tick
+  next_trade_gap_ticks: 1
+  simulation_interval_minutes: 30
+  simulation_max_ticks: 100000
+  risk_streak: 6
+
+payout:
+  refresh_minutes: 60
+  probe_stake: 10                # quote-only proposal; nothing is ever bought
+  currency: USD
+  max_age_minutes: 180           # older quotes count as "payout unknown"
+  rate_limit_pause_s: 60         # on a Deriv RateLimit reply: pause, then retry the same quote (max 3x)
+  retry_failed_minutes: 5        # if any quote is still missing, refresh again after 5 min instead of 60
+
+signals:
+  start_confirm_cycles: 3        # consecutive RUN CANDIDATE evaluations before START
+  stop_confirm_cycles: 3         # consecutive failing evaluations before STOP (critical faults: immediate)
+  restart_cooldown_minutes: 30   # minimum time between a STOP and the next START of the same combination
+  startup_grace_s: 300           # after a restart, hold data-fault STOPs while back-fill catches up
+  offline_stop_s: 120            # analyzer itself down this long -> active signals get a critical STOP on restart
+
+telegram:
+  enabled: true
+  timezone: Asia/Colombo
+  daily_summary: false
+  daily_summary_time: "08:00"
+  send_timeout_s: 15
+  max_attempts: 20
+  critical_alerts: true
+  error_alert_cooldown_minutes: 60
+
+storage:
+  db_path: data/analyzer.db
+
+logging:
+  dir: logs
+  level: INFO
+  max_bytes: 10485760
+  backups: 10
+
+strategies:
+  dir: strategies
+  enabled: [all]                 # or a list of keys, e.g. [aria, aria_v2, navix]
+
+heartbeat:
+  file: data/heartbeat.json
+  interval_s: 30
+  silence_alert_minutes: 5

@@ -1,0 +1,44 @@
+# Source: Pulse2.xml (Deriv DBot Blockly). Reproduced, not modified.
+# Even/Odd — the audit marked it optional (outside the Over/Under brief). Enabled because
+# the master brief lists all 10 bots; disable it in config.yaml (strategies.enabled) if unwanted.
+key: pulse2
+name: Pulse2
+source_file: Pulse2.xml
+optional: true
+original:
+  market: synthetic_index
+  submarket: random_index
+  symbol: R_100
+  trade_type: digits / evenodd (contract type "both")
+  restart_on_error: true
+  restart_buy_sell_on_error: false
+
+legs:
+  - id: main
+    description: "Before purchase: if last_digit in {0, 3, 6, 9} purchase DIGITEVEN (1 tick)."
+    contract_type: DIGITEVEN
+    duration_ticks: 1
+    trigger: {type: last_digit_in, digits: [0, 3, 6, 9]}
+    trigger_text: "last digit in {0, 3, 6, 9}"
+    compare_to: unconditional
+
+sequence:
+  steps: [main]
+  on_win: reset
+  on_loss: advance
+  overflow: hold_last
+
+stake:
+  model: multiply
+  base: 0.75
+  factor: 2.05
+  text: "On loss: Initial Amount += |loss| x 1.05 (x2.05). On win: Initial Amount = 0.75."
+
+take_profit: 5
+stop_loss: 3000
+stop_loss_text: "After every contract: stop if total_profit >= 5, or negative with |total_profit| >= 3000 ('Max Acceptable Loss')."
+
+non_purchase_logic:
+  - "Four tick_analysis blocks compute pivot points, R1-R3 / S1-S3 crosses and a 'worm' colour; none feeds the purchase decision."
+known_issues:
+  - "The 3,000 stop-loss is only reached around the 12th consecutive loss."

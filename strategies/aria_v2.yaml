@@ -1,0 +1,50 @@
+# Source: Aria V2.xml (Deriv DBot Blockly). Reproduced, not modified.
+key: aria_v2
+name: Aria V2
+source_file: Aria V2.xml
+original:
+  market: synthetic_index
+  submarket: random_index
+  symbol: 1HZ10V
+  trade_type: digits / overunder (contract type "both")
+  restart_on_error: true
+  restart_buy_sell_on_error: false
+
+legs:
+  - id: base
+    description: "Loss == 0 (first trade, and every trade after a win). Prediction ternary -> 9."
+    contract_type: DIGITUNDER
+    barrier: 9
+    duration_ticks: 1
+    trigger: {type: every_tick}
+    trigger_text: "none — buys on every tick (all four Random branches purchase DIGITUNDER)"
+  - id: recovery
+    description: "Loss >= 1. The ternary's 'Loss >= 2 -> 6' branch is unreachable because 'Loss >= 1 -> 5' is checked first."
+    contract_type: DIGITUNDER
+    barrier: 5
+    duration_ticks: 1
+    trigger: {type: every_tick}
+    trigger_text: "none — buys on every tick while in recovery"
+
+sequence:
+  steps: [base, recovery]
+  on_win: reset
+  on_loss: advance
+  overflow: hold_last
+
+stake:
+  model: multiply
+  base: 1.0
+  factor: 2.1
+  text: "On loss: Stake = |contract profit| x 2.1. On win: Stake = 1."
+
+take_profit: 20
+stop_loss: 50
+stop_loss_text: "After a settled loss: stop if total_profit is negative and |total_profit| >= 50. After a win: stop if total_profit >= 20."
+
+non_purchase_logic:
+  - "A text prompt (NAME) and Random 0-9 only change notification text; every branch purchases DIGITUNDER."
+  - "Two disabled orphan blocks (total_profit, variables_get text7) have no effect."
+known_issues:
+  - "The prediction-6 branch can never be reached."
+  - "Stop-loss 50 is breached on the 6th consecutive loss (-77.06)."

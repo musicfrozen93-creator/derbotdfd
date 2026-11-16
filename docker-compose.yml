@@ -1,0 +1,57 @@
+# Deriv Market Condition Analyzer — Portainer CE stack (Web editor).
+#
+# The image must exist on the Docker host first (build it once over SSH, see
+# docs/PORTAINER_DEPLOYMENT.md):   docker build -t deriv-market-analyzer:1.0.0 .
+# For Portainer "Repository" deployments use docker-compose.repository.yml instead
+# (identical, plus a build section).
+#
+# Secrets are NOT written here. Set them in Portainer -> Stack -> "Environment variables".
+
+services:
+  analyzer:
+    image: deriv-market-analyzer:${ANALYZER_IMAGE_TAG:-1.0.0}
+    container_name: deriv-analyzer
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      ANALYZER_DRY_RUN: ${ANALYZER_DRY_RUN:-true}       # safe default: log notifications, send nothing
+      ANALYZER_CONFIG: ${ANALYZER_CONFIG:-/app/config.yaml}
+    volumes:
+      - analyzer-data:/app/data      # SQLite database (ticks, signal state, outbox), heartbeat
+      - analyzer-logs:/app/logs      # rotating application log (10 MB x 10 files)
+    networks:
+      - analyzer-net
+    # no "ports": the analyzer only makes outbound connections (Deriv WebSocket, Telegram API)
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    stop_signal: SIGTERM
+    stop_grace_period: 45s           # the app needs < 30 s to flush ticks and close cleanly
+    mem_limit: 1500m                 # measured peak ~325 MB at 20 markets x 400k ticks
+    read_only: true                  # only the two volumes and /tmp are writable
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  analyzer-data:
+    name: deriv-analyzer-data        # fixed names: independent of the stack name
+  analyzer-logs:
+    name: deriv-analyzer-logs
+
+networks:
+  analyzer-net:
+    name: deriv-analyzer-net
+    driver: bridge

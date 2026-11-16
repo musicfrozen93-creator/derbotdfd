@@ -1,0 +1,49 @@
+# Source: Aria.xml (Deriv DBot Blockly). Reproduced, not modified.
+key: aria
+name: Aria
+source_file: Aria.xml
+original:
+  market: synthetic_index
+  submarket: random_index
+  symbol: 1HZ10V
+  trade_type: digits / overunder (contract type "both")
+  restart_on_error: true
+  restart_buy_sell_on_error: false
+
+legs:
+  - id: base
+    description: "Loss == 0 (first trade, and every trade after a win). Prediction ternary -> 9."
+    contract_type: DIGITUNDER
+    barrier: 9
+    duration_ticks: 1
+    trigger: {type: every_tick}
+    trigger_text: "none — buys on every tick (all four Random branches purchase DIGITUNDER)"
+  - id: recovery
+    description: "Loss >= 1 (after any loss, until a win). Ternary checks Loss>=1 before Loss>=2, so always 5."
+    contract_type: DIGITUNDER
+    barrier: 5
+    duration_ticks: 1
+    trigger: {type: every_tick}
+    trigger_text: "none — buys on every tick while in recovery"
+
+sequence:
+  steps: [base, recovery]
+  on_win: reset        # Stake = Win Stake (1), Loss = 0
+  on_loss: advance     # Loss += 1 -> prediction 5
+  overflow: hold_last
+
+stake:
+  model: multiply
+  base: 1.0
+  factor: 2.1
+  text: "On loss: Stake = |contract profit| x 2.1 (= previous stake x 2.1). On win: Stake = 1."
+
+take_profit: 200
+stop_loss: 200
+stop_loss_text: "After a settled loss: stop if total_profit is negative and |total_profit| >= 200. After a win: stop if total_profit >= 200."
+
+non_purchase_logic:
+  - "Random = random integer 0-9 only selects which notification text is shown ('Now Trading Under 9/5', 'Still Trading Under 5'); every branch, including ELSE, purchases DIGITUNDER."
+  - "'Trend List' / 'list' variables are created but never used."
+known_issues:
+  - "Stop-loss is checked only after a loss settles, so the realised loss can exceed 200 (8th loss in a row = -342.94)."
