@@ -10,14 +10,13 @@ import time
 import numpy as np
 import pytest
 
-from app.analytics.payout import payout_key
 from app.analytics.validation import AVOID, INSUFFICIENT, RUN, WAIT
 from app.signals.engine import SignalEngine
 from app.signals.state import SignalStateStore
 from app.signals.telegram import MessageFormatter, TelegramSender
 
 from tests.test_signals import T0, make_engine, notes, run_cycles, verdict
-from tests.test_validation import _analyzer_setup, q
+from tests.test_digit_rule import analyzer_setup
 
 KEY = ("aria", "1HZ10V")
 
@@ -276,26 +275,20 @@ def test_outbox_delivers_each_message_once_across_restart_and_failures(db, bots,
 
 # --------------------------------------------- end to end: real analyzer + engine
 def test_genuine_feed_failure_invalidates_active_signal_end_to_end(db, bots, cfg, rng):
-    """Synthetic data with a real edge reaches RUN_CANDIDATE through the real analyzer, the
-    engine STARTs; then the live feed goes FAULT and the same pipeline STOPs immediately."""
-    digits = rng.integers(0, 5, 30000)          # only 0-4: Aria's UNDER 9 and UNDER 5 always win
-    an, market, compat, now = _analyzer_setup(db, bots, cfg, digits)
-    dq = dict(cfg.data_quality)
-    dq["chi2_fault_p"] = 0.0                     # the uniformity alarm would (correctly) block this
-    an.dq = type(cfg.data_quality)(dq)
-    payouts = {payout_key("SYN", "DIGITUNDER", 9, 1): q(0.917, "SYN", "DIGITUNDER", 9, 1),
-               payout_key("SYN", "DIGITUNDER", 5, 1): q(0.512, "SYN", "DIGITUNDER", 5, 1)}
+    """Digits where every winning digit is above 10% reach RUN_CANDIDATE through the real analyzer,
+    the engine STARTs; then the live feed goes FAULT and the same pipeline STOPs immediately."""
+    digits = rng.permutation(np.repeat(np.arange(10), [55] * 9 + [5]))   # Aria wins on 0-8: each 11.0%
+    an, market, compat, now = analyzer_setup(db, bots, cfg, digits)
     conn, _ = db
     eng = make_engine(conn, bots, cfg, started_at=now - 10_000)
     combos = [("aria", "SYN")]
     out = []
     for i in range(3):
-        res = an.evaluate(combos, compat, {"SYN": market}, payouts, {"SYN": ("OK", "live")}, now)
+        res = an.evaluate(combos, compat, {"SYN": market}, {"SYN": ("OK", "live")}, now)
         assert res.verdicts[("aria", "SYN")].status == RUN
         out += eng.process(res.verdicts, now + i)
     assert kinds(out) == ["START"]
-    res = an.evaluate(combos, compat, {"SYN": market}, payouts,
-                      {"SYN": ("FAULT", "no ticks for 180 s")}, now + 180)
+    res = an.evaluate(combos, compat, {"SYN": market}, {"SYN": ("FAULT", "no ticks for 180 s")}, now + 180)
     v = res.verdicts[("aria", "SYN")]
     assert v.status == AVOID and v.critical and v.critical_kind == "data"
     tr = eng.process(res.verdicts, now + 180)

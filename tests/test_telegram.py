@@ -2,57 +2,80 @@
 import asyncio
 import logging
 import time
-from decimal import Decimal
 
-from app.analytics.payout import Quote
-from app.analytics.validation import RUN, BotVerdict, LegVerdict, SymbolQuality
+from app.analytics.validation import RUN, RuleConfig, SymbolQuality, evaluate_combo
 from app.monitoring.logger import RedactFilter
 from app.signals.telegram import MessageFormatter, TelegramSender, enqueue
-from app.strategies.evaluator import LegStats
 
 T = 1_794_823_660.0   # 2026-11-16 10:07:40 UTC
+RULE = RuleConfig.from_settings(type("C", (), dict(mode="individual", threshold_pct=10, window_ticks=500,
+                                                   contracts="all"))())
 
 
-def aria_v2_verdict(bots):
-    legs = []
-    for leg, wr, be in (("base", 0.904, 0.9174), ("recovery", 0.52, 0.5128)):
-        st = LegStats(n_ticks=312400, n_events=280000, wins=int(280000 * wr), wr=wr, ci_lo=wr - 0.001,
-                      ci_hi=wr + 0.001, disc_n=196000, disc_lo=wr - 0.0013, oos_n=84000, oos_wr=wr, p0=0.9,
-                      q_value=0.012, runs_p=0.44)
-        l = bots["aria_v2"].leg(leg)
-        legs.append(LegVerdict(leg, l.label, 1, l.trigger_text, RUN, ["ok"], {}, st,
-                               Quote("1HZ10V", l.contract_type, l.barrier, 1, Decimal("10.00"),
-                                     Decimal(str(round(10 / be, 2))), be, T)))
-    q = SymbolQuality("1HZ10V", "CLEAN", "clean", "OK", 312400)
-    return BotVerdict("aria_v2", "Aria V2", "1HZ10V", "Volatility 10 (1s) Index", RUN, False, [], legs, q, True,
-                      "all legs supported")
+def predator_verdict(bots, counts):
+    """Predator (DIGITOVER 3 -> winning digits 4-9) on 1HZ10V with the given digit counts (sum 500)."""
+    assert sum(counts) == 500
+    q = SymbolQuality("1HZ10V", "CLEAN", "live feed OK", "OK", 500, 1.0, list(counts))
+    return evaluate_combo(bots["predator"], "1HZ10V", "Volatility 10 (1s) Index", q, compatible=True,
+                          compat_text="all legs supported", rule=RULE, now=T)
+
+
+# digit:      0   1   2   3   4   5   6   7   8   9
+PASSING = [42, 42, 42, 43, 56, 54, 61, 52, 57, 51]    # 4-9: 11.2 10.8 12.2 10.4 11.4 10.2 %
+FAILING = [44, 44, 44, 45, 56, 54, 61, 52, 49, 51]    # same, but digit 8 = 9.80 %
 
 
 def test_start_message_format(bots):
-    fmt = MessageFormatter(bots, "Asia/Colombo")
-    text = fmt.start(aria_v2_verdict(bots), T)
-    for needle in ("🟢 START SIGNAL", "Bot: Aria V2", "Market: Volatility 10 (1s) Index", "Symbol: 1HZ10V",
-                   "Contract: DIGITUNDER 9 (base) → DIGITUNDER 5 (recovery)", "Duration: 1 tick",
-                   "Status: Conditions Confirmed", "Sample size: 312,400 ticks", "Trigger events: 280,000",
-                   "Break-even: 91.74%", "95% CI", "Data quality: PASS", "Contract availability: PASS",
-                   "1 in 320", "stop-loss 50 breached at loss #6", "ACTION: You may consider running Aria V2 on 1HZ10V.",
-                   "suitability notification, not a guaranteed trading signal", "(Asia/Colombo)", "UTC"):
+    v = predator_verdict(bots, PASSING)
+    assert v.status == RUN
+    text = MessageFormatter(bots, "Asia/Colombo").start(v, T)
+    for needle in ("🟢 START SIGNAL", "Bot: Predator", "Market: Volatility 10 (1s) Index", "Symbol: 1HZ10V",
+                   "Contract (main): DIGITOVER, barrier 3, 1 tick", "Winning digits: 4, 5, 6, 7, 8, 9",
+                   "every winning digit of a contract must be > 10% of the last 500 ticks",
+                   "• Digit 4: 11.20% ✅", "• Digit 6: 12.20% ✅", "• Digit 9: 10.20% ✅", "Result: PASS ✅",
+                   "Signal status: START — 1 of 1 contract PASS (all required)",
+                   "ACTION: You may consider running Predator on 1HZ10V.",
+                   "not a guaranteed trading signal", "(Asia/Colombo)", "UTC"):
         assert needle in text, needle
+    assert "❌" not in text
     assert "2026-11-16 15:37:40 (Asia/Colombo) · 10:07:40 UTC" in text     # UTC+05:30
+    for gone in ("Break-even", "win-rate", "95% CI", "confidence", "Trigger events"):
+        assert gone not in text, gone
     assert len(text) <= 4096
+
+
+def test_start_message_multi_contract_bot(bots):
+    q = SymbolQuality("R_50", "CLEAN", "live feed OK", "OK", 500, 1.0, [55] * 5 + [45] * 5)
+    v = evaluate_combo(bots["aria_v2"], "R_50", "Volatility 50 Index", q, compatible=True, compat_text="ok",
+                       rule=RULE, now=T)
+    assert v.status == "WAIT"                          # digits 5-8 are 9.00%: base fails, recovery passes
+    text = MessageFormatter(bots, "Asia/Colombo").stop(v, T)
+    for needle in ("Contract 1 of 2 (base): DIGITUNDER, barrier 9, 1 tick",
+                   "Contract 2 of 2 (recovery): DIGITUNDER, barrier 5, 1 tick",
+                   "Winning digits: 0, 1, 2, 3, 4, 5, 6, 7, 8", "Winning digits: 0, 1, 2, 3, 4",
+                   "• Digit 0: 11.00% ✅", "• Digit 5: 9.00% ❌",
+                   "Result: FAIL ❌ — digits 5 (9.00%), 6 (9.00%), 7 (9.00%), 8 (9.00%) at or below 10%",
+                   "Result: PASS ✅", "Signal status: STOP — 1 of 2 contracts FAILED", "Failed contract:",
+                   "• DIGITUNDER 9 (base) — digits 5 (9.00%), 6 (9.00%), 7 (9.00%), 8 (9.00%) at or below 10%"):
+        assert needle in text, needle
+    assert "DIGITUNDER 5 (recovery) —" not in text            # the passing contract is not listed as failed
 
 
 def test_stop_message_format(bots):
     fmt = MessageFormatter(bots, "Asia/Colombo")
-    v = aria_v2_verdict(bots)
-    v.status = "WAIT"
-    v.reasons = ["base: lower 95% bound 90.20% ≤ break-even 91.74%"]
+    v = predator_verdict(bots, FAILING)
+    assert v.status == "WAIT" and v.contracts[0].failing_digits == [8]
     text = fmt.stop(v, T)
-    for needle in ("🔴 STOP SIGNAL", "Bot: Aria V2", "Symbol: 1HZ10V", "The previously confirmed conditions are no "
-                   "longer satisfied.", "Validation status: FAILED (WAIT)", "Current win-rate assessment",
-                   "Data quality: CLEAN", "ACTION: Stop running Aria V2 on 1HZ10V."):
+    for needle in ("🔴 STOP SIGNAL", "Bot: Predator", "Market: Volatility 10 (1s) Index", "Symbol: 1HZ10V",
+                   "Contract (main): DIGITOVER, barrier 3, 1 tick", "Winning digits: 4, 5, 6, 7, 8, 9",
+                   "• Digit 8: 9.80% ❌", "• Digit 4: 11.20% ✅",
+                   "Result: FAIL ❌ — digit 8 (9.80%) at or below 10%",
+                   "Signal status: STOP — 1 of 1 contract FAILED",
+                   "• DIGITOVER 3 (main) — digit 8 (9.80%) at or below 10%",
+                   "ACTION: Stop running Predator on 1HZ10V."):
         assert needle in text, needle
-    assert "WAIT" not in fmt.start(aria_v2_verdict(bots), T).split("\n")[0]
+    assert "(critical)" not in text.split("\n")[0]
+    assert fmt.stop(v, T, critical=True).startswith("🔴 STOP SIGNAL (critical)")
 
 
 def test_critical_and_recovery_format(bots):

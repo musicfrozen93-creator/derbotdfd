@@ -10,7 +10,7 @@ T0 = 1_800_000_000.0
 def verdict(bot="aria", sym="1HZ10V", status=RUN, critical_kind=None, hold=False):
     q = SymbolQuality(sym, "CLEAN", "clean", "OK", 100000)
     return BotVerdict(bot, bot.title(), sym, sym, status, critical_kind is not None,
-                      [] if status == RUN else [f"{status} reason"], [], q, critical_kind != "contract",
+                      [] if status == RUN else [f"{status} reason"], q, critical_kind != "contract",
                       "ok", critical_kind=critical_kind, hold=hold)
 
 
