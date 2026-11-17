@@ -1,5 +1,10 @@
 # Final pre-deployment audit (2026-11-16)
 
+> **Signal rule changed on 2026-11-17.** The win-rate / break-even / confidence-bound / FDR /
+> out-of-sample gates and payout quotes described below were removed. A bot × market now
+> passes only when every winning digit of the bot's contracts is above 10 % of the last 500
+> ticks (README → "How it works"). This file is kept as a record of the earlier checks.
+
 Scope: inspect the existing code, fix only verified issues, and report what was and was not
 checked. Nothing in this audit places trades, uses a Deriv account or token, or changes a bot's
 entry rules.

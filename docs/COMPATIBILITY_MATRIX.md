@@ -1,5 +1,19 @@
 # Bot × market compatibility matrix
 
+> **Signal rule changed on 2026-11-17.** The win-rate / break-even / confidence-bound / FDR /
+> out-of-sample gates and payout quotes described below were removed. A bot × market now
+> passes only when every winning digit of the bot's contracts is above 10 % of the last 500
+> ticks (README → "How it works"). This file is kept as a record of the earlier checks.
+
+> **Since 2026-11-17 the analyzer monitors Continuous Indices only.** The market filter keeps the
+> API submarket `random_index` (R_10, R_25, R_50, R_75, R_100) plus the 1-second indices the bot
+> XML files use (1HZ10V, 1HZ50V). Live run on 2026-11-17: 95 markets listed, **7 kept, 70 bot ×
+> market combinations, all 10 bots compatible with all 7.** Excluded: Jump (JD10–JD100),
+> Crash/Boom (20), Range Break (RB100, RB200), Daily Reset (RDBEAR, RDBULL), Step (stpRNG–
+> stpRNG5), Forex Basket (WLDAUD, WLDEUR, WLDGBP, WLDUSD), Commodities Basket (WLDXAU), the other
+> six 1-second indices (1HZ15V, 1HZ25V, 1HZ30V, 1HZ75V, 1HZ90V, 1HZ100V) and every non-synthetic
+> market. The rest of this page is the earlier all-market run, kept for reference.
+
 Source: live dry-run of the production configuration against Deriv's public API on
 2026-11-16 (12:16–12:28 UTC, then two restarts). `active_symbols` listed 95 symbols, 52 of them
 synthetic; `contracts_for` was called for all 52. **19 markets offer the digit contracts the bots

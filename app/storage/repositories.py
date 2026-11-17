@@ -9,6 +9,7 @@ from typing import Iterable
 import numpy as np
 
 from app.market.precision import scaled_int
+from app.storage.database import transaction
 
 
 def now_i() -> int:
@@ -21,13 +22,8 @@ def insert_ticks(conn: sqlite3.Connection, rows: Iterable[tuple[str, int, str, i
     if not rows:
         return 0
     before = conn.total_changes
-    conn.execute("BEGIN")
-    try:
+    with transaction(conn, "insert_ticks"):
         conn.executemany("INSERT OR IGNORE INTO ticks(symbol, epoch, quote, digit) VALUES (?,?,?,?)", rows)
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
     return conn.total_changes - before
 
 
@@ -88,30 +84,35 @@ def load_series_rows(conn, symbol: str, max_ticks: int, after_epoch: int | None 
 
 def prune_ticks(conn, before_epoch: int) -> int:
     before = conn.total_changes
-    conn.execute("DELETE FROM ticks WHERE epoch < ?", (before_epoch,))
+    with transaction(conn, "prune_ticks"):
+        conn.execute("DELETE FROM ticks WHERE epoch < ?", (before_epoch,))
     return conn.total_changes - before
 
 
 # --------------------------------------------------------------- markets
 def upsert_markets(conn, markets) -> None:
     ts = now_i()
-    conn.execute("BEGIN")
-    for m in markets:
-        conn.execute(
-            "INSERT INTO markets(symbol, display_name, market, submarket, pip_decimals, exchange_is_open,"
-            " is_trading_suspended, first_seen, last_seen, active) VALUES (?,?,?,?,?,?,?,?,?,1)"
-            " ON CONFLICT(symbol) DO UPDATE SET display_name=excluded.display_name, market=excluded.market,"
-            " submarket=excluded.submarket, pip_decimals=excluded.pip_decimals,"
-            " exchange_is_open=excluded.exchange_is_open, is_trading_suspended=excluded.is_trading_suspended,"
-            " last_seen=excluded.last_seen, active=1",
-            (m.symbol, m.display_name, m.market, m.submarket, m.pip_decimals, int(m.exchange_is_open),
-             int(m.is_trading_suspended), ts, ts))
-    conn.execute("COMMIT")
+    with transaction(conn, "upsert_markets"):
+        for m in markets:
+            conn.execute(
+                "INSERT INTO markets(symbol, display_name, market, submarket, pip_decimals, exchange_is_open,"
+                " is_trading_suspended, first_seen, last_seen, active) VALUES (?,?,?,?,?,?,?,?,?,1)"
+                " ON CONFLICT(symbol) DO UPDATE SET display_name=excluded.display_name, market=excluded.market,"
+                " submarket=excluded.submarket, pip_decimals=excluded.pip_decimals,"
+                " exchange_is_open=excluded.exchange_is_open, is_trading_suspended=excluded.is_trading_suspended,"
+                " last_seen=excluded.last_seen, active=1",
+                (m.symbol, m.display_name, m.market, m.submarket, m.pip_decimals, int(m.exchange_is_open),
+                 int(m.is_trading_suspended), ts, ts))
+
+
+def active_market_symbols(conn) -> list[str]:
+    return [r[0] for r in conn.execute("SELECT symbol FROM markets WHERE active=1")]
 
 
 def deactivate_markets(conn, symbols: Iterable[str]) -> None:
-    for s in symbols:
-        conn.execute("UPDATE markets SET active=0 WHERE symbol=?", (s,))
+    with transaction(conn, "deactivate_markets"):
+        for s in symbols:
+            conn.execute("UPDATE markets SET active=0 WHERE symbol=?", (s,))
 
 
 def load_markets(conn) -> list[sqlite3.Row]:
@@ -120,14 +121,13 @@ def load_markets(conn) -> list[sqlite3.Row]:
 
 def replace_contracts(conn, symbol: str, contracts) -> None:
     ts = now_i()
-    conn.execute("BEGIN")
-    conn.execute("DELETE FROM contracts WHERE symbol=?", (symbol,))
-    for c in contracts.contracts.values():
-        conn.execute("INSERT INTO contracts(symbol, contract_type, min_ticks, max_ticks, digit_range, updated_at)"
-                     " VALUES (?,?,?,?,?,?)",
-                     (symbol, c.contract_type, c.min_ticks, c.max_ticks,
-                      json.dumps(c.digit_range) if c.digit_range is not None else None, ts))
-    conn.execute("COMMIT")
+    with transaction(conn, "replace_contracts"):
+        conn.execute("DELETE FROM contracts WHERE symbol=?", (symbol,))
+        for c in contracts.contracts.values():
+            conn.execute("INSERT INTO contracts(symbol, contract_type, min_ticks, max_ticks, digit_range,"
+                         " updated_at) VALUES (?,?,?,?,?,?)",
+                         (symbol, c.contract_type, c.min_ticks, c.max_ticks,
+                          json.dumps(c.digit_range) if c.digit_range is not None else None, ts))
 
 
 def load_contracts(conn, symbol: str):
@@ -146,47 +146,47 @@ def load_contracts(conn, symbol: str):
 
 def save_compatibility(conn, rows: list[tuple[str, str, bool, str]]) -> None:
     ts = now_i()
-    conn.execute("BEGIN")
-    conn.execute("DELETE FROM compatibility")
-    conn.executemany("INSERT INTO compatibility(bot, symbol, compatible, reasons, updated_at) VALUES (?,?,?,?,?)",
-                     [(b, s, int(ok), r, ts) for b, s, ok, r in rows])
-    conn.execute("COMMIT")
-
-
-# ---------------------------------------------------------------- payouts
-def save_payout(conn, symbol, contract_type, barrier, duration, stake, payout, break_even, error=None) -> None:
-    conn.execute(
-        "INSERT INTO payouts(symbol, contract_type, barrier, duration, stake, payout, break_even, fetched_at, error)"
-        " VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(symbol, contract_type, barrier, duration) DO UPDATE SET"
-        " stake=excluded.stake, payout=excluded.payout, break_even=excluded.break_even,"
-        " fetched_at=excluded.fetched_at, error=excluded.error",
-        (symbol, contract_type, str(barrier), int(duration), None if stake is None else str(stake),
-         None if payout is None else str(payout), break_even, now_i(), error))
-
-
-def save_payout_error(conn, symbol, contract_type, barrier, duration, error: str) -> None:
-    """Record an error without discarding a previously fetched valid payout."""
-    row = conn.execute("SELECT 1 FROM payouts WHERE symbol=? AND contract_type=? AND barrier=? AND duration=?",
-                       (symbol, contract_type, str(barrier), int(duration))).fetchone()
-    if row:
-        conn.execute("UPDATE payouts SET error=? WHERE symbol=? AND contract_type=? AND barrier=? AND duration=?",
-                     (error, symbol, contract_type, str(barrier), int(duration)))
-    else:
-        save_payout(conn, symbol, contract_type, barrier, duration, None, None, None, error)
-
-
-def load_payouts(conn) -> list[sqlite3.Row]:
-    return conn.execute("SELECT * FROM payouts").fetchall()
+    with transaction(conn, "save_compatibility"):
+        conn.execute("DELETE FROM compatibility")
+        conn.executemany("INSERT INTO compatibility(bot, symbol, compatible, reasons, updated_at)"
+                         " VALUES (?,?,?,?,?)", [(b, s, int(ok), r, ts) for b, s, ok, r in rows])
 
 
 # ------------------------------------------------------------ evaluations
-def save_evaluations(conn, rows: list[tuple[str, str, str, dict]]) -> None:
+def save_evaluations(conn, rows: list[tuple[str, str, str, dict]], contract_rows: list[tuple] | None = None) -> None:
+    """Replace the latest evaluation of every combination and, in the same transaction, the
+    per-contract results. ``contract_rows``: (bot, symbol, bot_status, ContractResult).
+
+    All or nothing: if any write fails, the previous cycle's evaluations AND contract results
+    are kept unchanged (rollback) and the original exception is raised."""
     ts = now_i()
-    conn.execute("BEGIN")
-    conn.execute("DELETE FROM evaluations")
-    conn.executemany("INSERT INTO evaluations(bot, symbol, status, evaluated_at, summary) VALUES (?,?,?,?,?)",
-                     [(b, s, st, ts, json.dumps(summary, default=str)) for b, s, st, summary in rows])
-    conn.execute("COMMIT")
+    eval_rows = [(b, s, st, ts, json.dumps(summary, default=str)) for b, s, st, summary in rows]
+    result_rows = [(b, s, c.leg_id, c.contract_type, c.barrier, c.duration, c.label,
+                    ",".join(map(str, c.winning_digits)),
+                    json.dumps({str(d): round(p, 4) for d, p in c.digit_pct.items()}),
+                    ",".join(map(str, c.failing_digits)), c.result, c.detail, st, ts)
+                   for b, s, st, c in (contract_rows or [])]
+    with transaction(conn, "save_evaluations"):
+        conn.execute("DELETE FROM evaluations")
+        conn.executemany("INSERT INTO evaluations(bot, symbol, status, evaluated_at, summary) VALUES (?,?,?,?,?)",
+                         eval_rows)
+        conn.execute("DELETE FROM contract_results")
+        conn.executemany(
+            "INSERT INTO contract_results(bot, symbol, leg_id, contract_type, barrier, duration, label,"
+            " winning_digits, digit_pct, failing_digits, result, detail, bot_status, evaluated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", result_rows)
+
+
+def load_contract_results(conn, bot: str | None = None, symbol: str | None = None) -> list:
+    q = "SELECT * FROM contract_results WHERE 1=1"
+    params: list = []
+    if bot:
+        q += " AND bot=?"
+        params.append(bot)
+    if symbol:
+        q += " AND symbol=?"
+        params.append(symbol)
+    return conn.execute(q + " ORDER BY bot, symbol, rowid", params).fetchall()
 
 
 # -------------------------------------------------------------- meta / kv
@@ -196,29 +196,33 @@ def meta_get(conn, key: str, default: str | None = None) -> str | None:
 
 
 def meta_set(conn, key: str, value: str) -> None:
-    conn.execute("INSERT INTO meta(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                 (key, value))
+    with transaction(conn, f"meta_set:{key}"):
+        conn.execute("INSERT INTO meta(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (key, value))
 
 
 # -------------------------------------------------------------- incidents
 def open_incident(conn, key: str, kind: str, symbol: str | None, detail: str) -> bool:
     """Open an incident. Returns True if it was not already open."""
-    row = conn.execute("SELECT closed_at FROM incidents WHERE key=?", (key,)).fetchone()
-    if row is not None and row[0] is None:
-        return False
-    conn.execute("INSERT INTO incidents(key, kind, symbol, opened_at, closed_at, detail) VALUES (?,?,?,?,NULL,?)"
-                 " ON CONFLICT(key) DO UPDATE SET kind=excluded.kind, symbol=excluded.symbol,"
-                 " opened_at=excluded.opened_at, closed_at=NULL, detail=excluded.detail",
-                 (key, kind, symbol, now_i(), detail))
+    with transaction(conn, "open_incident"):
+        row = conn.execute("SELECT closed_at FROM incidents WHERE key=?", (key,)).fetchone()
+        if row is not None and row[0] is None:
+            return False
+        conn.execute("INSERT INTO incidents(key, kind, symbol, opened_at, closed_at, detail)"
+                     " VALUES (?,?,?,?,NULL,?)"
+                     " ON CONFLICT(key) DO UPDATE SET kind=excluded.kind, symbol=excluded.symbol,"
+                     " opened_at=excluded.opened_at, closed_at=NULL, detail=excluded.detail",
+                     (key, kind, symbol, now_i(), detail))
     return True
 
 
 def close_incident(conn, key: str) -> tuple[bool, int | None]:
     """Close an open incident. Returns (was_open, opened_at)."""
-    row = conn.execute("SELECT opened_at, closed_at FROM incidents WHERE key=?", (key,)).fetchone()
-    if row is None or row[1] is not None:
-        return False, None
-    conn.execute("UPDATE incidents SET closed_at=? WHERE key=?", (now_i(), key))
+    with transaction(conn, "close_incident"):
+        row = conn.execute("SELECT opened_at, closed_at FROM incidents WHERE key=?", (key,)).fetchone()
+        if row is None or row[1] is not None:
+            return False, None
+        conn.execute("UPDATE incidents SET closed_at=? WHERE key=?", (now_i(), key))
     return True, row[0]
 
 

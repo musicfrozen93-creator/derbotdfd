@@ -120,12 +120,16 @@ sudo /opt/deriv-market-analyzer/status.sh
 
 What to expect:
 
-* `event=discovery_done ... monitored=20 compatible_pairs=200` within a minute (the numbers follow
+* `event=market_filter allowed=1HZ10V,1HZ50V,R_10,R_100,R_25,R_50,R_75 ...` and
+  `event=discovery_done ... monitored=7 compatible_pairs=70` within a minute (the numbers follow
   whatever Deriv lists that day);
 * history download for about an hour (`bootstrap_done` once per market);
-* payout quotes (`payout_refresh_done requested=300 ok=300`, ~10 minutes at 30 quotes/min);
-* after that, `status.sh` shows counts of WAIT / AVOID / INSUFFICIENT_DATA. On fair digits
-  that is the normal steady state; a START is not expected.
+* as soon as a market has 500 ticks, `event=evaluation_cycle combos=70 checks=70
+  contract_checks=126` every minute, and `rule_passed` / `rule_status` lines (with every
+  contract's PASS / FAIL) whenever a combination's status or a contract's result changes;
+* `python scripts/report.py --contracts` lists every contract's latest result;
+* `status.sh` shows RUN_CANDIDATE / WAIT / INSUFFICIENT_DATA counts. A START needs every winning
+  digit above 10 % of the last 500 ticks for 3 checks in a row.
 
 Check memory once bootstrap is done:
 

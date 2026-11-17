@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Read-only console report: heartbeat, compatibility matrix, current verdicts,
-active signals, payouts and recent notifications. No dashboard needed.
+"""Read-only console report: heartbeat, compatibility matrix, current verdicts with every
+contract's own PASS / FAIL, active signals, digit percentages and recent notifications.
 
     python scripts/report.py            # full report
     python scripts/report.py --brief    # short status
     python scripts/report.py --matrix   # compatibility matrix only
     python scripts/report.py --bot aria --symbol 1HZ10V   # one combination in detail
+    python scripts/report.py --contracts                  # one line per contract (contract_results table)
 """
 import argparse
 import json
@@ -17,11 +18,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import load_settings  # noqa: E402
 from app.monitoring.heartbeat import read_heartbeat  # noqa: E402
+from app.storage import repositories as repo  # noqa: E402
 from app.storage.database import connect  # noqa: E402
 
 
-def pct(x):
-    return "   n/a" if x is None else f"{100 * x:6.2f}%"
+def contracts_text(sm: dict) -> str:
+    """One line per combination: every contract with its own PASS / FAIL and failing digits."""
+    out = []
+    for c in sm.get("contracts") or []:
+        fail = c.get("failing_digits") or []
+        out.append(f"{c['label']}={c['result']}" + (f"[{','.join(map(str, fail))}]" if fail else ""))
+    total = sm.get("contracts_total", len(out))
+    return f"{sm.get('contracts_passing', 0)}/{total} pass · " + "  ".join(out)
+
+
+def contract_detail(c: dict, threshold) -> list[str]:
+    pc = c.get("digit_pct") or {}
+    fail = set(c.get("failing_digits") or [])
+    digits = "  ".join(f"{d}:{pc[str(d)]:.2f}%{'✗' if d in fail else ''}" for d in c["winning_digits"]
+                       if str(d) in pc)
+    barrier = "-" if c.get("barrier") is None else c["barrier"]
+    return [f"      contract {c['leg_id']:<9} {c['contract_type']:<10} barrier {barrier}  {c['duration']}t"
+            f"  -> {c['result']}",
+            f"          winning digits {','.join(map(str, c['winning_digits']))}: {digits or 'n/a'}",
+            f"          {c.get('detail') or ''}"]
+
 
 
 def main() -> int:
@@ -30,6 +51,7 @@ def main() -> int:
     ap.add_argument("--matrix", action="store_true")
     ap.add_argument("--bot")
     ap.add_argument("--symbol")
+    ap.add_argument("--contracts", action="store_true", help="list every contract's latest result")
     args = ap.parse_args()
     s = load_settings()
     db = s.path(s.storage.db_path)
@@ -81,22 +103,38 @@ def main() -> int:
     if not args.brief:
         for r in evals:
             sm = json.loads(r["summary"])
-            reason = (sm.get("reasons") or [""])[0]
-            print(f"  {r['status']:<17} {r['bot']:<12} {r['symbol']:<8} {reason[:90]}")
+            print(f"  {r['status']:<17} {r['bot']:<12} {r['symbol']:<8} {contracts_text(sm)}")
             if args.bot or args.symbol:
-                for lv in sm.get("legs", []):
-                    st = lv["stats"]
-                    be = (lv.get("payout") or {}).get("break_even")
-                    print(f"      leg {lv['leg']:<9} {lv['label']:<13} {lv['duration']}t  events={st['n_events']:>8,}"
-                          f"  WR={pct(st['wr'])}  CI=[{pct(st['ci_lo'])},{pct(st['ci_hi'])}]  p0={pct(st['p0'])}"
-                          f"  BE={pct(be)}  OOS={pct(st['oos_wr'])}  q={st['q_value']}")
-                    for k, v in lv["checks"].items():
-                        print(f"          {k:<30} {v}")
+                rule = sm.get("rule") or {}
+                print(f"      rule: each contract on its own, every winning digit > {rule.get('threshold_pct')}% "
+                      f"over the last {rule.get('window_ticks')} ticks; every contract must pass")
+                for reason_line in sm.get("reasons") or []:
+                    print(f"      {reason_line}")
+                for c in sm.get("contracts", []):
+                    for line in contract_detail(c, rule.get("threshold_pct")):
+                        print(line)
                 qd = sm.get("quality") or {}
-                print(f"      data quality: {qd.get('status')} — {qd.get('detail')} · ticks={qd.get('n_ticks'):,}"
-                      f" · chi² p={qd.get('chi2_p')}")
-                if sm.get("sim"):
-                    print(f"      replay simulation: {sm['sim']}")
+                counts = qd.get("counts") or []
+                n = qd.get("n_ticks") or 0
+                if n:
+                    print("      all digits: " + "  ".join(f"{d}:{100 * c / n:.2f}%" for d, c in enumerate(counts)))
+                print(f"      live feed: {qd.get('status')} — {qd.get('detail')} · window ticks={n:,}")
+
+    if args.contracts:
+        try:
+            rows = repo.load_contract_results(conn, args.bot, args.symbol)
+        except Exception:                      # database created before contract_results existed
+            rows = []
+        tally = {}
+        for r in rows:
+            tally[r["result"]] = tally.get(r["result"], 0) + 1
+        print(f"\nContract results ({len(rows)} contracts): {tally}")
+        print(f"  {'bot':<12} {'market':<8} {'contract':<10} {'type':<10} {'bar':>3}  {'winning':<18} "
+              f"{'result':<11} detail")
+        for r in rows:
+            bar = "-" if r["barrier"] is None else r["barrier"]
+            print(f"  {r['bot']:<12} {r['symbol']:<8} {r['leg_id']:<10} {r['contract_type']:<10} {bar:>3}  "
+                  f"{r['winning_digits']:<18} {r['result']:<11} {r['detail']}")
 
     act = conn.execute("SELECT bot, symbol, last_start_at FROM signal_state WHERE active=1").fetchall()
     print(f"\nActive START signals: {len(act)}")
@@ -104,13 +142,6 @@ def main() -> int:
         print(f"  {r['bot']} on {r['symbol']} since {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(r['last_start_at']))}")
 
     if not args.brief:
-        pays = conn.execute("SELECT * FROM payouts ORDER BY symbol, contract_type, barrier").fetchall()
-        print(f"\nPayout quotes: {len(pays)}")
-        for p in pays[:200]:
-            age = int(now - (p["fetched_at"] or 0))
-            be = p["break_even"]
-            print(f"  {p['symbol']:<8} {p['contract_type']:<10} {p['barrier']:>2} {p['duration']}t  stake {p['stake']}"
-                  f" payout {p['payout']}  break-even {pct(be)}  age {age}s {('ERR ' + p['error']) if p['error'] else ''}")
         notes = conn.execute("SELECT id, kind, status, created_at FROM notifications ORDER BY id DESC LIMIT 10").fetchall()
         print("\nRecent notifications:")
         for n in notes:

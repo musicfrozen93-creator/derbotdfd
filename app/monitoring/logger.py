@@ -71,7 +71,8 @@ def _fmt_value(value) -> str:
     return s
 
 
-def event(logger: logging.Logger, event_name: str, level: int = logging.INFO, /, **fields) -> None:
-    """Log a structured event: ``event=<event_name> key=value ...``."""
+def event(logger: logging.Logger, event_name: str, level: int = logging.INFO, /, *, exc_info=None,
+          **fields) -> None:
+    """Log a structured event: ``event=<event_name> key=value ...`` (``exc_info``: add a traceback)."""
     parts = [f"event={event_name}"] + [f"{k}={_fmt_value(v)}" for k, v in fields.items()]
-    logger.log(level, " ".join(parts))
+    logger.log(level, " ".join(parts), exc_info=exc_info)

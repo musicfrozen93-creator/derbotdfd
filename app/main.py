@@ -18,11 +18,11 @@ from zoneinfo import ZoneInfo
 
 from app import __version__
 from app.analytics.analyzer import Analyzer, EvalResult, SeriesCache
-from app.analytics.payout import PayoutBook
+from app.analytics.validation import RuleConfig
 from app.config import Settings, load_settings
 from app.deriv.client import DerivAPIError, DerivClient, NotConnectedError
 from app.deriv.contracts import fetch_contracts
-from app.deriv.symbols import MarketInfo, fetch_active_symbols, select_candidates
+from app.deriv.symbols import MarketInfo, classify_market, fetch_active_symbols, select_candidates
 from app.market.collector import Collector
 from app.market.health import FAULT as LIVE_FAULT
 from app.market.health import HealthMonitor
@@ -33,7 +33,7 @@ from app.signals.engine import SignalEngine
 from app.signals.state import SignalStateStore
 from app.signals.telegram import MessageFormatter, TelegramSender, enqueue
 from app.storage import repositories as repo
-from app.storage.database import init_db
+from app.storage.database import init_db, transaction, write_stats
 from app.strategies.compatibility import CompatResult, build_matrix
 from app.strategies.loader import load_strategies
 from app.strategies.triggers import describe_trigger
@@ -58,17 +58,15 @@ class Application:
             general_per_min=float(dv.rate_limit_general_per_min),
             proposal_per_min=float(dv.rate_limit_proposal_per_min))
         self.processor = TickProcessor(self.conn, self.health, missing_factor=float(dq.missing_factor))
-        self.cache = SeriesCache(self.db_path, int(an.max_ticks))
+        self.rule = RuleConfig.from_settings(settings.signal_rule)
+        self.cache = SeriesCache(self.db_path, self.rule.window_ticks)
         self.processor.on_out_of_order = self.cache.mark_dirty
         self.collector = Collector(self.client, self.conn, self.processor, self.health, settings.collection,
                                    on_history_inserted=self.cache.mark_history)
         self.client.on_tick = self.processor.on_tick
         self.client.add_connect_hook(self.collector.on_connect)
         self.client.add_disconnect_hook(self.collector.on_disconnect)
-        pc = settings.payout
-        self.payouts = PayoutBook(self.conn, stake=float(pc.probe_stake), currency=str(pc.currency),
-                                  max_age_s=float(pc.max_age_minutes) * 60)
-        self.analyzer = Analyzer(self.bots, self.cache, an, dq)
+        self.analyzer = Analyzer(self.bots, self.cache, self.rule)
         tg = settings.telegram
         self.formatter = MessageFormatter(self.bot_map, str(tg.timezone), int(an.risk_streak))
         self.store = SignalStateStore(self.conn)
@@ -78,14 +76,19 @@ class Application:
                                      timeout=float(tg.send_timeout_s), max_attempts=int(tg.max_attempts))
         self.all_markets: dict[str, MarketInfo] = {}
         self.markets: dict[str, MarketInfo] = {}
+        self.excluded_markets: dict[str, list[str]] = {}   # reason -> symbols (last discovery)
         self.contracts: dict = {}
         self.matrix: dict[tuple[str, str], CompatResult] = {}
         self.discovery_done = asyncio.Event()
         self.last_eval: EvalResult | None = None
-        self.last_status: dict[tuple[str, str], str] = {}
+        self.last_status: dict[tuple[str, str], tuple] = {}     # (status, per-contract results)
         self._error_alerts: dict[str, float] = {}
         self._tasks: list[asyncio.Task] = []
         self.started_at = time.time()
+        # evaluation health (heartbeat -> scripts/healthcheck.py)
+        self.last_eval_ok_at: float | None = None      # last cycle fully evaluated, saved and processed
+        self.eval_failures_consecutive = 0
+        self.last_eval_error: str | None = None
 
     # ------------------------------------------------------------ discovery
     async def discover(self) -> None:
@@ -94,12 +97,27 @@ class Application:
         if not listed:
             raise RuntimeError("active_symbols returned no markets")
         self.all_markets = {m.symbol: m for m in listed}
-        cands = select_candidates(listed, include_markets=list(cfg.markets),
-                                  include_submarkets=list(cfg.include_submarkets),
-                                  exclude_symbols=list(cfg.exclude_symbols))
+        # Market filter (Continuous Indices only, see config.yaml "discovery"). Applied here, before
+        # contracts_for: a symbol that fails it never reaches the compatibility matrix, tick
+        # subscriptions or evaluation.
+        rules = dict(include_markets=list(cfg.markets), include_submarkets=list(cfg.include_submarkets),
+                     exclude_symbols=list(cfg.exclude_symbols),
+                     one_second_symbols=list(cfg.one_second_symbols))
+        cands = select_candidates(listed, **rules)
+        excluded: dict[str, list[str]] = {}
+        for m in listed:
+            if m not in cands:
+                ok, why = classify_market(m, **rules)
+                excluded.setdefault(why, []).append(m.symbol)
+        self.excluded_markets = excluded
+        event(log, "market_filter", allowed=",".join(sorted(m.symbol for m in cands)),
+              excluded=sum(len(v) for v in excluded.values()),
+              excluded_synthetic=";".join(f"{why}: {','.join(sorted(v))}" for why, v in sorted(excluded.items())
+                                          if "discovery.markets" not in why))
         repo.upsert_markets(self.conn, cands)
-        gone = [s for s in self.markets if s not in self.all_markets]
-        if gone:
+        allowed = {m.symbol for m in cands}
+        gone = [s for s in repo.active_market_symbols(self.conn) if s not in allowed]
+        if gone:                                    # delisted, or excluded by the market filter
             repo.deactivate_markets(self.conn, gone)
         contracts = {}
         for m in cands:
@@ -164,41 +182,6 @@ class Application:
                 await self.system_error("discovery", exc)
                 await asyncio.sleep(60)
 
-    # --------------------------------------------------------------- payouts
-    def needed_quotes(self) -> set[tuple]:
-        out = set()
-        for (bkey, sym), r in self.matrix.items():
-            if not r.compatible or sym not in self.markets:
-                continue
-            for leg in self.bot_map[bkey].legs:
-                out.add((sym, leg.contract_type, leg.barrier, leg.duration_ticks))
-        return out
-
-    async def payout_loop(self) -> None:
-        await self.discovery_done.wait()
-        while True:
-            delay = float(self.s.payout.refresh_minutes) * 60
-            try:
-                await self.client.wait_connected(None)
-                await self.payouts.refresh(self.client, self.needed_quotes(),
-                                           rate_limit_pause_s=float(self.s.payout.rate_limit_pause_s))
-                if self.payouts.failed:            # some quotes missing: try again sooner
-                    delay = min(delay, float(self.s.payout.retry_failed_minutes) * 60)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.exception("event=payout_refresh_failed")
-                await self.system_error("payout", exc)
-                delay = min(delay, float(self.s.payout.retry_failed_minutes) * 60)
-            await asyncio.sleep(delay)
-
-    def payout_snapshot(self, now: float) -> dict:
-        snap = {}
-        for key, q in list(self.payouts.quotes.items()):
-            if q.break_even is not None and now - q.fetched_at <= self.payouts.max_age_s:
-                snap[key] = q
-        return snap
-
     # ------------------------------------------------------------ evaluation
     def combos(self) -> tuple[list[tuple[str, str]], dict]:
         combos = {k for k, r in self.matrix.items() if r.compatible and k[1] in self.markets}
@@ -220,24 +203,45 @@ class Application:
         combos, missing = self.combos()
         live = {sym: self.health.status(sym, now) for sym in self.markets}
         result = await asyncio.to_thread(self.analyzer.evaluate, combos, self.matrix, self.all_markets,
-                                         self.payout_snapshot(now), live, now)
+                                         live, now)
         for sym, q in result.quality.items():
             self.health.set_nominal(sym, q.nominal_interval)
-        repo.save_evaluations(self.conn, [(v.bot, v.symbol, v.status, v.summary())
-                                          for v in result.verdicts.values()])
+        save_error: Exception | None = None
+        try:
+            repo.save_evaluations(self.conn, [(v.bot, v.symbol, v.status, v.summary())
+                                              for v in result.verdicts.values()],
+                                  [(v.bot, v.symbol, v.status, c) for v in result.verdicts.values()
+                                   for c in v.contracts])
+        except Exception as exc:
+            # Rolled back by save_evaluations (previous cycle's results stay intact). The cycle still
+            # runs the STOP rules below, but gives no START credit (starts_allowed=False).
+            save_error = exc
+            self.eval_failures_consecutive += 1
+            self.last_eval_error = f"save_evaluations: {type(exc).__name__}: {exc}"[:300]
+            event(log, "evaluation_save_failed", logging.ERROR, error=f"{type(exc).__name__}: {exc}"[:300],
+                  consecutive=self.eval_failures_consecutive, starts_allowed=False)
         for key, v in result.verdicts.items():
+            # logged when the bot's status or any contract's PASS / FAIL result changes
+            state = (v.status, tuple(c.result for c in v.contracts))
             prev = self.last_status.get(key)
-            if prev != v.status:
-                lvl = logging.INFO
-                event(log, "validation_" + ("passed" if v.status == "RUN_CANDIDATE" else "status"), lvl,
-                      bot=v.bot, symbol=v.symbol, status=v.status, previous=prev,
-                      reason=(v.reasons[0] if v.reasons else ""))
-                self.last_status[key] = v.status
-        self.engine.process(result.verdicts, now, missing)
+            if prev != state:
+                event(log, "rule_" + ("passed" if v.status == "RUN_CANDIDATE" else "status"), logging.INFO,
+                      bot=v.bot, symbol=v.symbol, status=v.status, previous=(prev[0] if prev else None),
+                      contracts_passing=f"{len(v.passing_contracts)}/{len(v.contracts)}",
+                      contracts=v.contracts_text(), reason=" | ".join(v.reasons))
+                self.last_status[key] = state
+        self.engine.process(result.verdicts, now, missing, starts_allowed=save_error is None)
         self.last_eval = result
         slow = result.duration_s > float(self.s.analysis.interval_s)
         event(log, "evaluation_slow" if slow else "evaluation_cycle", logging.WARNING if slow else logging.INFO,
-              combos=len(combos), tests=result.tests, seconds=round(result.duration_s, 2), sims=result.sims_ran)
+              combos=len(combos), checks=result.tests, contract_checks=result.contract_checks,
+              seconds=round(result.duration_s, 2))
+        if save_error is not None:
+            await self.system_error("evaluation_save", save_error)
+        else:
+            self.last_eval_ok_at = time.time()
+            self.eval_failures_consecutive = 0
+            self.last_eval_error = None
         return result
 
     async def evaluation_loop(self) -> None:
@@ -251,7 +255,9 @@ class Application:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.exception("event=evaluation_failed")
+                self.eval_failures_consecutive += 1
+                self.last_eval_error = f"{type(exc).__name__}: {exc}"[:300]
+                log.exception("event=evaluation_failed consecutive=%d", self.eval_failures_consecutive)
                 await self.system_error("evaluation", exc)
             await asyncio.sleep(max(1.0, interval - (time.monotonic() - t0)))
 
@@ -364,10 +370,32 @@ class Application:
         c = connect(self.db_path)
         try:
             n = repo.prune_ticks(c, cutoff)
-            c.execute("DELETE FROM notifications WHERE status!='pending' AND created_at < ?", (cutoff,))
+            with transaction(c, "prune_notifications"):
+                c.execute("DELETE FROM notifications WHERE status!='pending' AND created_at < ?", (cutoff,))
             return n
         finally:
             c.close()
+
+    def heartbeat_payload(self) -> dict:
+        """What the heartbeat file publishes (read by scripts/healthcheck.py and status tools)."""
+        last_tick = max((h.last_wall or 0) for h in self.health.symbols.values()) if self.health.symbols else 0
+        st_counts: dict[str, int] = {}
+        if self.last_eval:
+            for v in self.last_eval.verdicts.values():
+                st_counts[v.status] = st_counts.get(v.status, 0) + 1
+        return {
+            "version": __version__, "connected": self.client.connected,
+            "monitored_symbols": sorted(self.markets), "last_tick_wall": int(last_tick),
+            "bootstrap_done": sorted(self.collector.bootstrap_done),
+            "backfill_queue": self.collector.queue.qsize(),
+            "active_signals": self._active_on(), "status_counts": st_counts,
+            "started_at": int(self.started_at),
+            # evaluation / database write health (healthcheck: stale evaluation cycles)
+            "last_eval_ok_at": int(self.last_eval_ok_at) if self.last_eval_ok_at else None,
+            "eval_failures_consecutive": self.eval_failures_consecutive,
+            "last_eval_error": self.last_eval_error,
+            "db": write_stats(self.conn),
+        }
 
     async def heartbeat_loop(self) -> None:
         path = self.s.path(self.s.heartbeat.file)
@@ -380,19 +408,9 @@ class Application:
                 log.exception("event=mark_alive_failed")
             try:
                 now = time.time()
-                last_tick = max((h.last_wall or 0) for h in self.health.symbols.values()) if self.health.symbols else 0
-                st_counts: dict[str, int] = {}
-                if self.last_eval:
-                    for v in self.last_eval.verdicts.values():
-                        st_counts[v.status] = st_counts.get(v.status, 0) + 1
-                write_heartbeat(path, {
-                    "version": __version__, "connected": self.client.connected,
-                    "monitored_symbols": sorted(self.markets), "last_tick_wall": int(last_tick),
-                    "bootstrap_done": sorted(self.collector.bootstrap_done),
-                    "backfill_queue": self.collector.queue.qsize(),
-                    "active_signals": self._active_on(), "status_counts": st_counts,
-                    "started_at": int(self.started_at),
-                })
+                payload = self.heartbeat_payload()
+                last_tick = payload["last_tick_wall"]
+                write_heartbeat(path, payload)
                 if self.markets and now - self.started_at > max(silence, 60):
                     if last_tick and now - last_tick > silence:
                         self._alert("silence", "silence", None, "no market data",
@@ -459,7 +477,7 @@ class Application:
                 loop.add_signal_handler(sig, stop.set)
             except (NotImplementedError, RuntimeError):  # Windows
                 pass
-        coros = [self.client.run(), self.discovery_loop(), self.payout_loop(), self.evaluation_loop(),
+        coros = [self.client.run(), self.discovery_loop(), self.evaluation_loop(),
                  self.collector.flush_loop(float(self.s.collection.flush_interval_s)),
                  self.collector.backfill_worker(), self.gap_audit_loop(), self.health_loop(),
                  self.notifier_loop(), self.heartbeat_loop(), self.retention_loop(), self.daily_summary_loop()]

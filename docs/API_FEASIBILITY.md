@@ -1,5 +1,10 @@
 # Phase B — Deriv API feasibility (tested live, 2026-11-16)
 
+> **Signal rule changed on 2026-11-17.** The win-rate / break-even / confidence-bound / FDR /
+> out-of-sample gates and payout quotes described below were removed. A bot × market now
+> passes only when every winning digit of the bot's contracts is above 10 % of the last 500
+> ticks (README → "How it works"). This file is kept as a record of the earlier checks.
+
 These checks were run against the real Deriv public WebSocket from a Windows workstation
 with no API token, using `scripts/live_api_check.py` (20/20 passed) and two probe scripts.
 The full application was then run in dry-run mode against the live feed (see the end of this file).

@@ -213,9 +213,12 @@ Click **Deploy the stack**. Then check:
    ```
    event=analyzer_starting version=1.0.0 bots=10 telegram=dry_run
    event=api_connected url=wss://api.derivws.com/...
-   event=discovery_done listed=.. candidates=.. monitored=19 compatible_pairs=190
+   event=market_filter allowed=1HZ10V,1HZ50V,R_10,R_100,R_25,R_50,R_75 excluded=88 ...
+   event=discovery_done listed=95 candidates=7 monitored=7 compatible_pairs=70
    ```
-   The monitored counts depend on what Deriv lists that day.
+   The counts follow Deriv's listing (these are from 2026-11-17). Only Continuous Indices plus
+   1HZ10V / 1HZ50V are monitored; `python scripts/list_markets.py` shows what is allowed and
+   why everything else is excluded.
 3. **First start:** for about an hour the analyzer downloads tick history (`bootstrap_done`
    lines). The evaluations show `INSUFFICIENT_DATA` until enough ticks are stored. That is
    expected; no START is sent without enough data.
@@ -242,16 +245,17 @@ sudo docker logs --since 1h deriv-analyzer | grep -E "level=(WARNING|ERROR|CRITI
 **Line format.** Each line looks like this, with UTC timestamps:
 
 ```
-2026-11-16T13:03:49.426Z level=INFO logger=app event=evaluation_cycle combos=190 tests=67 seconds=3.51 sims=True
+2026-11-18T13:03:49.426Z level=INFO logger=app event=evaluation_cycle combos=70 checks=70 contract_checks=126 seconds=0.05
+2026-11-18T13:03:49.430Z level=INFO logger=app event=rule_status bot=aria_v2 symbol=1HZ10V status=WAIT previous=RUN_CANDIDATE contracts_passing=1/2 contracts="base:DIGITUNDER9=PASS recovery:DIGITUNDER5=FAIL[3]" reason="contract DIGITUNDER 5 (recovery) FAIL - digit at or below 10%: 3 = 9.80%"
 ```
 
 | What | Look for |
 |---|---|
 | Start / stop | `analyzer_starting`, `analyzer_restart`, `analyzer_stopping`, `analyzer_stopped crashed=False` |
 | WebSocket | `api_connected`, `api_disconnected`, `api_reconnect_wait`, `api_connection_error` |
-| Market discovery | `discovery_done`, `market_added_to_monitoring`, `market_removed_from_monitoring`, `discovery_failed` |
+| Market discovery | `market_filter` (allowed / excluded markets), `discovery_done`, `market_added_to_monitoring`, `market_removed_from_monitoring`, `discovery_failed` |
 | History download | `bootstrap_done`, `gap_backfill_done`, `missing_ticks_detected`, `backfill_job_failed` |
-| Evaluation | `evaluation_cycle` (every minute), `evaluation_slow` (WARNING) |
+| Evaluation | `evaluation_cycle` (every minute), `rule_passed` / `rule_status` (a combination's status or one of its contracts' PASS / FAIL changed; `contracts=` lists every contract's result and failing digits), `evaluation_slow` (WARNING) |
 | Signals | `notification_not_sent reason=dry_run` (dry run), `telegram_sent`, `signal_stop` |
 | Telegram problems | `telegram_send_failed`, `notification_not_sent reason=telegram_not_configured` |
 | Critical | `level=ERROR`, `level=CRITICAL`, `task_crashed`, `incident_opened` |
@@ -350,9 +354,11 @@ scp <user>@<VPS-IP>:/opt/deriv-backups/analyzer-20261116-130542.db .   # from yo
 0 3 * * * docker exec deriv-analyzer python scripts/backup_db.py --keep 3 >> /var/log/deriv-analyzer-backup.log 2>&1
 ```
 
-**Size.** The database keeps 30 days of ticks. With about 19 markets it grows to roughly
-**1–1.5 GB** after a month; it measured 16 MB for 460,000 ticks. Each backup is about the
-same size, so `--keep 3` uses up to about 4.5 GB. Check usage with:
+**Size.** The database keeps 30 days of ticks. With the 7 monitored markets it grows to roughly
+**0.4–0.5 GB** after a month; it measured 16 MB for 460,000 ticks. Each backup is about the
+same size, so `--keep 3` uses up to about 1.5 GB. Ticks stored earlier for markets that are now
+excluded (for example Jump Indices) are no longer read and are removed by the normal 30-day
+retention; nothing has to be migrated. Check usage with:
 
 ```bash
 sudo du -sh /var/lib/docker/volumes/deriv-analyzer-data/_data
@@ -442,7 +448,7 @@ sudo docker volume rm deriv-analyzer-data deriv-analyzer-logs
 | Symptom | Cause / fix |
 |---|---|
 | *pull access denied for deriv-market-analyzer* / *image not found* | The image was not built on this VPS, or the tag differs from `ANALYZER_IMAGE_TAG`. Run `sudo docker images deriv-market-analyzer`, rebuild (§2), and keep **Re-pull image** off. |
-| Status *unhealthy* | Run `sudo docker inspect --format '{{json .State.Health}}' deriv-analyzer` and `sudo docker exec deriv-analyzer python scripts/healthcheck.py`. *no heartbeat file yet* or *heartbeat … old*: the service loop is not running; check the logs for `ERROR`. *disconnected and no tick*: there has been no connection to Deriv for more than 5 minutes (next row). |
+| Status *unhealthy* | Run `sudo docker inspect --format '{{json .State.Health}}' deriv-analyzer` and `sudo docker exec deriv-analyzer python scripts/healthcheck.py`. *no heartbeat file yet* or *heartbeat … old*: the service loop is not running; check the logs for `ERROR`. *disconnected and no tick*: there has been no connection to Deriv for more than 5 minutes (next row). *no evaluation cycle completed and saved for …*: evaluations have been failing for over 10 minutes; the message shows the last error (e.g. a database write error, also logged as `event=db_write_failed` / `event=evaluation_save_failed`). Check free disk space on the data volume, then restart the container. Docker does **not** restart an *unhealthy* container by itself (`restart: unless-stopped` only covers exits). |
 | `api_connection_error` / reconnect loop | Outbound network or DNS. Check with `sudo docker exec deriv-analyzer python -c "import socket; print(socket.gethostbyname('api.derivws.com'))"`. A firewall must allow outbound 443. |
 | Restart loop, `task_crashed` | A loop failed. The log line before `analyzer_stopped crashed=True` names it. Send the log lines; never the token. |
 | *Permission denied* on `/app/data` or `/app/logs` | Only happens if you replaced the named volumes with host folders (bind mounts). Fix: `sudo chown -R 10001:10001 /your/folder`. |

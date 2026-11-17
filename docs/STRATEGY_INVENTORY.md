@@ -1,5 +1,10 @@
 # Phase A — Strategy inventory (10 DBot XML files)
 
+> **Signal rule changed on 2026-11-17.** The win-rate / break-even / confidence-bound / FDR /
+> out-of-sample gates and payout quotes described below were removed. A bot × market now
+> passes only when every winning digit of the bot's contracts is above 10 % of the last 500
+> ticks (README → "How it works"). This file is kept as a record of the earlier checks.
+
 Each bot was re-read from its XML (Blockly) file and reconciled against the Phase 1 audit
 report. The machine-readable version is `strategies/<bot>.yaml`; the analyzer uses only those
 files. The original XML files are never opened for writing.
@@ -44,7 +49,8 @@ Aria and Aria V2 share their two legs, so the statistics are computed once and u
 | Pulse2 | 0.75 | × 2.05 | 5 | 3000 | SL reached around the 12th loss |
 
 The analyzer never uses these stakes to trade. They only produce the "x losses in a row cost y,
-about 1 in n" lines in START messages, with probabilities from the measured win rates.
+about 1 in n" lines in START messages, with theoretical probabilities from each
+contract's winning digits.
 
 ## Differences from the Phase 1 audit report
 

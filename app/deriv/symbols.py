@@ -59,18 +59,57 @@ async def fetch_active_symbols(client) -> list[MarketInfo]:
     return parse_active_symbols(msg)
 
 
-def select_candidates(markets: list[MarketInfo], *, include_markets: list[str],
-                      include_submarkets: list[str], exclude_symbols: list[str]) -> list[MarketInfo]:
+# Deriv's own submarket codes (active_symbols "submarket"), with readable names for logs/reports.
+CONTINUOUS_INDICES = "random_index"
+SUBMARKET_LABELS = {
+    "random_index": "Continuous Indices",
+    "jump_index": "Jump Indices",
+    "crash_index": "Crash/Boom Indices",
+    "range_index": "Range Break Indices",
+    "random_daily": "Daily Reset Indices",
+    "step_index": "Step Indices",
+    "forex_basket": "Forex Basket",
+    "commodity_basket": "Commodities Basket",
+}
+
+
+def submarket_label(submarket: str) -> str:
+    return SUBMARKET_LABELS.get(submarket, submarket or "unknown")
+
+
+def is_one_second(m: MarketInfo) -> bool:
+    """1-second variant of a Continuous Index (1HZ10V = "Volatility 10 (1s) Index").
+
+    The API lists these in the same submarket as the 2-second indices (``random_index``) and has
+    no field that tells them apart, so the symbol prefix and the "(1s)" in the name are used —
+    only *within* the API's Continuous Indices category, never to decide the category itself."""
+    return m.symbol.upper().startswith("1HZ") or "(1s)" in m.display_name.lower()
+
+
+def classify_market(m: MarketInfo, *, include_markets: list[str], include_submarkets: list[str],
+                    exclude_symbols: list[str], one_second_symbols: list[str] | None = None) -> tuple[bool, str]:
+    """Decide whether a listed market may be monitored. Returns (allowed, reason).
+
+    Order: API market -> API submarket -> 1-second allow-list -> explicit exclusions.
+    ``one_second_symbols=None`` means no 1-second restriction."""
     inc_m = set(include_markets or [])
     inc_s = set(include_submarkets or [])
-    exc = set(exclude_symbols or [])
-    out = []
-    for m in markets:
-        if inc_m and m.market not in inc_m:
-            continue
-        if inc_s and m.submarket not in inc_s:
-            continue
-        if m.symbol in exc:
-            continue
-        out.append(m)
-    return out
+    if inc_m and m.market not in inc_m:
+        return False, f"market '{m.market}' not in discovery.markets"
+    if inc_s and m.submarket not in inc_s:
+        return False, f"{submarket_label(m.submarket)} (submarket '{m.submarket}') not in discovery.include_submarkets"
+    if one_second_symbols is not None and is_one_second(m) and m.symbol not in set(one_second_symbols):
+        return False, "1-second index not in discovery.one_second_symbols"
+    if m.symbol in set(exclude_symbols or []):
+        return False, "listed in discovery.exclude_symbols"
+    return True, f"{submarket_label(m.submarket)} (submarket '{m.submarket}')"
+
+
+def select_candidates(markets: list[MarketInfo], *, include_markets: list[str],
+                      include_submarkets: list[str], exclude_symbols: list[str],
+                      one_second_symbols: list[str] | None = None) -> list[MarketInfo]:
+    """The markets that pass :func:`classify_market` — the only symbols that ever reach
+    contracts_for, the compatibility matrix, tick subscriptions and evaluation."""
+    return [m for m in markets
+            if classify_market(m, include_markets=include_markets, include_submarkets=include_submarkets,
+                               exclude_symbols=exclude_symbols, one_second_symbols=one_second_symbols)[0]]
