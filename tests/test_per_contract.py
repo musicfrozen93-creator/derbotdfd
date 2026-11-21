@@ -23,6 +23,7 @@ from app.signals.telegram import MessageFormatter
 from app.storage import repositories as repo
 
 from tests.conftest import make_rows
+from tests.strategy_support import make_runnable
 from tests.test_digit_rule import analyzer_setup, counts_for, window
 from tests.test_discovery import ALLOWED, DIGIT_SYMBOLS, FOREX, NO_DIGITS, FakeDeriv, app_factory  # noqa: F401
 from tests.test_signals import make_engine, notes
@@ -283,58 +284,78 @@ def _run_app(app_factory, rng, monkeypatch, counts):
     return app
 
 
-def test_contract_results_are_stored_in_sqlite(app_factory, monkeypatch, rng):  # noqa: F811
+def test_evaluation_results_are_stored_in_sqlite(app_factory, monkeypatch, rng):  # noqa: F811
+    """Every cycle stores, in one transaction: the decision and the four checks per combination
+    (strategy_evaluations), each leg's statistics / payout / EV (leg_evaluations), a history row when a
+    verdict changes, and the legacy digit rule per contract (contract_results, informational only)."""
     app = _run_app(app_factory, rng, monkeypatch, ARIA_BASE_ONLY_FAIL)
     res = asyncio.run(app.evaluate_once())
     rows = app.conn.execute("SELECT * FROM contract_results").fetchall()
-    assert len(rows) == sum(len(v.contracts) for v in res.verdicts.values()) == 18 * 7
-    assert res.contract_checks == 126
+    assert len(rows) == sum(len(v.legs) for v in res.verdicts.values()) == 18 * 7
     aria = {r["leg_id"]: r for r in repo.load_contract_results(app.conn, "aria", "R_50")}
     assert aria["base"]["result"] == "FAIL" and aria["base"]["failing_digits"] == "5"
     assert aria["base"]["winning_digits"] == "0,1,2,3,4,5,6,7,8" and aria["base"]["barrier"] == 9
     assert aria["recovery"]["result"] == "PASS" and aria["recovery"]["failing_digits"] == ""
     assert json.loads(aria["recovery"]["digit_pct"]) == pytest.approx({"0": 11.2, "1": 11.2, "2": 11.2,
                                                                        "3": 11.2, "4": 11.2})
-    assert aria["base"]["bot_status"] == WAIT
+    assert aria["base"]["bot_status"] == WAIT and "informational" in aria["base"]["detail"]
     zony = repo.load_contract_results(app.conn, "zony_ai", "R_10")
     assert [r["barrier"] for r in zony] == [0, 4, 5, 6, 7, 8]
     sm = json.loads(app.conn.execute("SELECT summary FROM evaluations WHERE bot='aria' AND symbol='R_50'")
                     .fetchone()[0])
-    assert [(c["leg_id"], c["result"]) for c in sm["contracts"]] == [("base", "FAIL"), ("recovery", "PASS")]
-    assert (sm["contracts_passing"], sm["contracts_total"]) == (1, 2)
-    # replaced, not appended, on the next cycle
+    assert sm["model"] == "strategy_v1" and set(sm["gates"]) == {"entry", "statistics", "economics", "risk"}
+    assert [(lg["leg_id"], lg["legacy_rule"]["result"]) for lg in sm["legs"]] == [("base", "FAIL"),
+                                                                                  ("recovery", "PASS")]
+    # no quote and no bankroll yet: payout economics and risk are UNKNOWN, which is never a pass
+    assert sm["gates"]["economics"]["status"] == "UNKNOWN" and sm["gates"]["risk"]["status"] == "UNKNOWN"
+    st = app.conn.execute("SELECT * FROM strategy_evaluations WHERE bot='aria' AND symbol='R_50'").fetchone()
+    assert (st["decision"], st["entry_status"], st["statistics_status"], st["economics_status"],
+            st["risk_status"]) == (WAIT, PASS, PASS, "UNKNOWN", "UNKNOWN")
+    legs = app.conn.execute("SELECT * FROM leg_evaluations WHERE bot='aria' AND symbol='R_50' ORDER BY rowid").fetchall()
+    assert [r["leg_id"] for r in legs] == ["base", "recovery"]
+    assert legs[0]["settled_long"] == 499 and legs[0]["payout"] is None and legs[0]["economics_status"] == "UNKNOWN"
+    assert app.conn.execute("SELECT COUNT(*) FROM evaluation_history").fetchone()[0] == 70
+    # replaced, not appended, on the next cycle; the history grows only when a verdict changes
     asyncio.run(app.evaluate_once())
-    assert app.conn.execute("SELECT COUNT(*) FROM contract_results").fetchone()[0] == 126
+    for t, n in (("contract_results", 126), ("leg_evaluations", 126), ("strategy_evaluations", 70),
+                 ("evaluations", 70), ("evaluation_history", 70)):
+        assert app.conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] == n, t
 
 
-def test_rule_status_log_lists_every_contract(app_factory, monkeypatch, rng, caplog):  # noqa: F811
+def test_verdict_log_shows_every_check(app_factory, monkeypatch, rng, caplog):  # noqa: F811
     app = _run_app(app_factory, rng, monkeypatch, ARIA_BASE_ONLY_FAIL)
     with caplog.at_level(logging.INFO):
         asyncio.run(app.evaluate_once())
-    lines = [r.getMessage() for r in caplog.records if "event=rule_status" in r.getMessage()
+    lines = [r.getMessage() for r in caplog.records if "event=verdict_status" in r.getMessage()
              and "bot=aria " in r.getMessage() and "symbol=R_50" in r.getMessage()]
     assert len(lines) == 1
-    assert 'contracts="base:DIGITUNDER9=FAIL[5] recovery:DIGITUNDER5=PASS"' in lines[0]
-    assert "contracts_passing=1/2" in lines[0]
+    # '!' = required for START and not passing
+    assert "entry=PASS statistics=PASS economics=UNKNOWN! risk=UNKNOWN!" in lines[0]
     cycle = [r.getMessage() for r in caplog.records if "event=evaluation_cycle" in r.getMessage()]
-    assert cycle and "contract_checks=126" in cycle[-1]
+    assert cycle and "legs=126" in cycle[-1] and "WAIT:70" in cycle[-1]
     caplog.clear()
     with caplog.at_level(logging.INFO):                      # nothing changed: no repeat log line
         asyncio.run(app.evaluate_once())
-    assert not [r for r in caplog.records if "event=rule_" in r.getMessage()]
+    assert not [r for r in caplog.records if "event=verdict_" in r.getMessage()]
 
 
-def test_report_shows_per_contract_results(app_factory, monkeypatch, rng, tmp_path):  # noqa: F811
+def test_report_shows_every_check_separately(app_factory, monkeypatch, rng, tmp_path):  # noqa: F811
     app = _run_app(app_factory, rng, monkeypatch, ARIA_BASE_ONLY_FAIL)
+    make_runnable(app, time.time())                 # fake quotes + bankroll: payout and risk get numbers
     asyncio.run(app.evaluate_once())
     cfg = tmp_path / "config.yaml"
     env = dict(os.environ, ANALYZER_CONFIG=str(cfg), PYTHONUTF8="1")
     out = subprocess.run([sys.executable, str(ROOT / "scripts" / "report.py"), "--bot", "aria", "--symbol", "R_50",
-                          "--contracts"], capture_output=True, text=True, encoding="utf-8", env=env, cwd=ROOT,
-                         timeout=60)
+                          "--contracts", "--quotes", "--history"], capture_output=True, text=True, encoding="utf-8",
+                         env=env, cwd=ROOT, timeout=60)
     assert out.returncode == 0, out.stderr
     o = out.stdout
-    assert "1/2 pass · DIGITUNDER 9=FAIL[5]  DIGITUNDER 5=PASS" in o
-    assert "contract base      DIGITUNDER barrier 9  1t  -> FAIL" in o
-    assert "contract recovery  DIGITUNDER barrier 5  1t  -> PASS" in o
-    assert "Contract results (2 contracts): {'FAIL': 1, 'PASS': 1}" in o
+    assert "aria         R_50     feed=CLEAN entry=PASS statistics=PASS economics=POSITIVE risk=SAFE" in o
+    assert "leg base      DIGITUNDER barrier 9  1t  stake 1.00" in o
+    assert "payout 1.17 for 1.00: net win +0.17, net loss -1.00, break-even 85.47%" in o
+    assert "legacy digit rule (informational, not a gate): FAIL [failing 5]" in o
+    assert "current recovery level: not observable" in o
+    assert "next trade: DIGITUNDER 9 1t at 1.00" in o
+    assert "Legacy digit rule per contract — informational only, gates nothing (2 contracts): {'FAIL': 1, 'PASS': 1}" in o
+    assert "Stored Deriv quotes:" in o and "Payout formula cross-check" in o
+    assert "Recent verdict changes" in o

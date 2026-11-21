@@ -12,6 +12,7 @@ import logging
 import sqlite3
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -22,10 +23,13 @@ from app.storage import repositories as repo
 from app.storage.database import connect, transaction, write_stats
 
 from tests.conftest import make_rows
+from tests.strategy_support import make_runnable
 from tests.test_digit_rule import window
 from tests.test_discovery import ALLOWED, DIGIT_SYMBOLS, FOREX, NO_DIGITS, FakeDeriv, app_factory  # noqa: F401
-from tests.test_per_contract import ARIA_BOTH, ARIA_REC_FAIL
+from tests.test_per_contract import ARIA_BOTH
 from tests.test_signals import RUN as S_RUN, T0, make_engine, notes, verdict
+
+ALL_NINES = [0] * 9 + [500]        # every last digit 9: Aria's UNDER contracts lose every trade
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -44,10 +48,13 @@ def msgs(caplog, name):
 
 
 def setup_app(app_factory, monkeypatch, rng, counts, start):  # noqa: F811
+    """Discovered app with stored ticks, a configured bankroll and (fake, favourable) quotes for every
+    stake the evaluation needs, so combinations whose own checks pass can reach RUN_CANDIDATE."""
     app = app_factory(FakeDeriv(DIGIT_SYMBOLS + NO_DIGITS + FOREX))
     asyncio.run(app.discover())
     feed(app, rng, counts, start)
     monkeypatch.setattr(app.health, "status", lambda sym, t: ("OK", "live"))
+    make_runnable(app, time.time())
     return app
 
 
@@ -71,25 +78,28 @@ def test_failed_contract_results_write_rolls_back_and_cannot_start(app_factory, 
     assert ("aria", "R_50") in run_keys
     assert notes(app.conn, "START") == []
     ok_at = app.last_eval_ok_at
+    hist_before = dict(app.history_tuples)
     before = {t: table(app.conn, t) for t in ("evaluations", "contract_results", "signal_events",
-                                              "notifications", "signal_state")}
+                                              "notifications", "signal_state", "strategy_evaluations",
+                                              "leg_evaluations", "evaluation_history")}
 
     app.conn.execute(FAIL_CONTRACT_RESULTS)
     with caplog.at_level(logging.INFO):
         res3 = cycle(app)                          # 3rd passing check, but its results cannot be saved
     assert {k for k, v in res3.verdicts.items() if v.status == RUN} == run_keys
 
-    # 1-2. rolled back: no transaction left open, previous cycle's rows untouched
+    # 1-2. rolled back: no transaction left open, previous cycle's rows untouched (every table of the cycle)
     assert app.conn.in_transaction is False
-    assert table(app.conn, "evaluations") == before["evaluations"]
-    assert table(app.conn, "contract_results") == before["contract_results"]
+    for t in ("evaluations", "contract_results", "strategy_evaluations", "leg_evaluations", "evaluation_history"):
+        assert table(app.conn, t) == before[t], t
+    assert app.history_tuples == hist_before
     # 5. no false PASS / START from the failed cycle (it would have been the 3rd consecutive pass)
     assert notes(app.conn, "START") == []
     assert table(app.conn, "signal_events") == before["signal_events"]
     assert all(app.store.get(*k).pass_streak == 0 and not app.store.get(*k).active for k in run_keys)
     # 6. logged and observable
     failed = msgs(caplog, "db_write_failed")
-    assert len(failed) == 1 and "what=save_evaluations" in failed[0] and "forced contract_results" in failed[0]
+    assert len(failed) == 1 and "what=save_strategy_cycle" in failed[0] and "forced contract_results" in failed[0]
     assert "rolled_back=True" in failed[0]
     assert [r for r in caplog.records if "event=db_write_failed" in r.getMessage()][0].exc_info is not None
     assert len(msgs(caplog, "evaluation_save_failed")) == 1
@@ -123,39 +133,52 @@ def test_failed_contract_results_write_rolls_back_and_cannot_start(app_factory, 
     assert notes(app.conn, "START") == []
     res = cycle(app)
     starts = app.conn.execute("SELECT dedupe_key FROM notifications WHERE kind='START'").fetchall()
-    assert sorted(k[0].split(":")[1:3] for k in starts) == sorted([list(k) for k in run_keys])  # once each
+    got = [tuple(k[0].split(":")[1:3]) for k in starts]
+    assert len(got) == len(set(got)) and set(got) <= run_keys                                  # once each
+    # every passing combination STARTs, except above the per-bot limit (5 per rolling 12 h, all markets)
+    per_bot = Counter(b for b, _ in run_keys)
+    assert Counter(b for b, _ in got) == {b: min(n, 5) for b, n in per_bot.items()}
     assert app.eval_failures_consecutive == 0 and app.last_eval_ok_at > ok_at
     assert write_stats(app.conn)["consecutive_failed"] == 0
-    # stored contract results are this cycle's and agree with every bot-level verdict
-    rows = repo.load_contract_results(app.conn)
-    assert len(rows) == sum(len(v.contracts) for v in res.verdicts.values())
+    # stored rows are this cycle's and agree with every verdict
+    rows = repo.load_contract_results(app.conn)               # legacy rule per leg (informational)
+    assert len(rows) == sum(len(v.legs) for v in res.verdicts.values())
+    strat = {(r["bot"], r["symbol"]): r for r in app.conn.execute("SELECT * FROM strategy_evaluations")}
+    assert set(strat) == set(res.verdicts)
     for key, v in res.verdicts.items():
         stored = [r for r in rows if (r["bot"], r["symbol"]) == key]
-        assert [r["result"] for r in stored] == [c.result for c in v.contracts]
+        assert [r["result"] for r in stored] == [lg.legacy_rule["result"] for lg in v.legs]
         assert all(r["bot_status"] == v.status for r in stored)
-        assert (v.status == RUN) == all(r["result"] == "PASS" for r in stored)
+        s = strat[key]
+        assert (s["decision"], s["entry_status"], s["statistics_status"], s["economics_status"],
+                s["risk_status"]) == v.status_tuple()
+        # RUN_CANDIDATE <=> every required check passes (never the legacy digit rule)
+        assert (v.status == RUN) == all(g["pass"] for g in v.gates.values() if g["required"])
     # more cycles: no duplicate START
     cycle(app)
-    assert len(notes(app.conn, "START")) == len(run_keys)
+    assert len(notes(app.conn, "START")) == len(got)
 
 
 def test_stop_rules_still_run_when_evaluations_cannot_be_saved(app_factory, monkeypatch, rng):  # noqa: F811
     now = int(time.time())
-    app = setup_app(app_factory, monkeypatch, rng, ARIA_BOTH, now - 1000)
+    app = setup_app(app_factory, monkeypatch, rng, ARIA_BOTH, now - 500)
     for _ in range(3):
         cycle(app)
-    assert app.store.get("aria", "R_50").active
+    # 1HZ10V: first of aria's 7 passing markets (the per-bot limit lets 5 of them START)
+    assert app.store.get("aria", "1HZ10V").active
     n_start = len(notes(app.conn, "START"))
-    feed(app, rng, ARIA_REC_FAIL, now - 500)          # newest 500 ticks: aria fails
+    # 500 older ticks back-filled, every last digit 9: over the long window aria's UNDER contracts now
+    # win far less often than fair, so its statistics FAIL (and its expected value is NEGATIVE)
+    feed(app, rng, ALL_NINES, now - 1000)
     app.conn.execute(FAIL_CONTRACT_RESULTS)
     cycle(app)
     cycle(app)
-    assert app.store.get("aria", "R_50").active      # 2 failing checks: not yet (3-check STOP unchanged)
+    assert app.store.get("aria", "1HZ10V").active      # 2 failing checks: not yet (3-check STOP unchanged)
     cycle(app)
-    assert not app.store.get("aria", "R_50").active
+    assert not app.store.get("aria", "1HZ10V").active
     stops = app.conn.execute("SELECT dedupe_key FROM notifications WHERE kind='STOP'").fetchall()
-    assert [k[0] for k in stops if k[0].startswith("STOP:aria:R_50:")] and \
-        len([k for k in stops if k[0].startswith("STOP:aria:R_50:")]) == 1
+    assert [k[0] for k in stops if k[0].startswith("STOP:aria:1HZ10V:")] and \
+        len([k for k in stops if k[0].startswith("STOP:aria:1HZ10V:")]) == 1
     assert len(notes(app.conn, "START")) == n_start and app.conn.in_transaction is False
 
 
@@ -374,7 +397,11 @@ def test_evaluations_during_initial_download_keep_the_service_healthy(app_factor
     now = int(time.time())
     app = setup_app(app_factory, monkeypatch, rng, [10] * 10, now - 100)   # only 100 of 500 ticks so far
     res = cycle(app)
-    assert {v.status for v in res.verdicts.values()} == {"INSUFFICIENT_DATA"}
+    st = {v.status for v in res.verdicts.values()}
+    # not enough ticks yet -> INSUFFICIENT_DATA; a bot whose recovery sequence is UNSAFE does not need
+    # ticks to be judged and is AVOID (critical risk) already. Either way: no START.
+    assert st <= {"INSUFFICIENT_DATA", "AVOID"} and "INSUFFICIENT_DATA" in st
+    assert all(v.critical_kind == "risk" for v in res.verdicts.values() if v.status == "AVOID")
     assert app.last_eval_ok_at is not None and app.eval_failures_consecutive == 0
     hb = dict(app.heartbeat_payload(), written_at=now)
     ok, why = healthcheck.check(hb, now + 30, 120, 300)

@@ -33,6 +33,7 @@ from app.strategies.compatibility import check
 from app.strategies.loader import win_digits
 
 from tests.conftest import make_rows
+from tests.strategy_support import make_runnable
 from tests.test_discovery import (ALLOWED, DIGIT_SYMBOLS, EXCLUDED_WITH_DIGITS, FOREX, NO_DIGITS,  # noqa: F401
                                   FakeDeriv, app_factory)
 from tests.test_signals import make_engine, notes
@@ -415,11 +416,13 @@ def test_10_non_continuous_indices_are_never_evaluated_or_signalled(app_factory,
         repo.insert_ticks(app.conn, make_rows(sym, passing, start_epoch=now - 500))
         app.cache.mark_dirty(sym)
     monkeypatch.setattr(app.health, "status", lambda sym, t: ("OK", "live"))
+    # fake quotes at twice the fair-odds payout (NOT a Deriv price) and a bankroll, so START is reachable
+    make_runnable(app, now, payout_fn=lambda stake, p: round(stake / p * 2, 2))
     app.engine.started_at = now - 10_000
     for _ in range(3):
         res = asyncio.run(app.evaluate_once())
     assert {s for _, s in res.verdicts} == set(ALLOWED)
-    assert res.verdicts[("predator", "R_50")].status == RUN
+    assert res.verdicts[("zony_ai", "R_50")].status == RUN
     started = {r[0] for r in app.conn.execute("SELECT text FROM notifications WHERE kind='START'")}
     syms = {line.split(": ", 1)[1] for t in started for line in t.splitlines() if line.startswith("Symbol: ")}
     assert syms and syms <= set(ALLOWED)

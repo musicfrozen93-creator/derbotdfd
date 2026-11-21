@@ -50,18 +50,46 @@ analysis:
   interval_s: 60                 # every combination is checked once a minute
   risk_streak: 6                 # losing streak used for the stake-ladder line in START messages
 
-# Signal rule ("Manual Conditions"). For every bot x market, EACH of the bot's contracts (from
-# strategies/*.yaml) is evaluated on its own winning digits: the contract passes only if every one
-# of its winning digits is STRICTLY above threshold_pct in the last window_ticks ticks of that
-# market (a digit at exactly 10.00% fails). The bot passes only if ALL its contracts pass.
-# Confirmation and cooldown are in "signals" below.
+# Legacy digit rule ("every winning digit > 10 % of the last 500 ticks"). Since the strategy
+# alignment it is computed and shown for information only and gates nothing: past digit
+# frequencies do not change the next digit (see ANALYZER_STRATEGY_ALIGNMENT reports).
+# window_ticks is still the RECENT window used by the bot-specific statistics and the minimum
+# amount of data before a combination is evaluated.
 signal_rule:
-  mode: individual               # each winning digit is checked on its own (AND over all of them)
-  threshold_pct: 10              # strictly greater than 10%
-  window_ticks: 500              # digit percentages over the last 500 ticks of the market
-  contracts: all                 # all = every contract the bot can buy, EACH checked on its own
-                                 #       winning digits; the bot passes only if all of them pass
-                                 # first = only the bot's first (entry) contract
+  mode: individual
+  threshold_pct: 10              # legacy rule only
+  window_ticks: 500              # recent window (ticks)
+  contracts: all                 # legacy rule only
+
+# Bot-specific evaluation (app/strategy_model/evaluate.py). Every bot x market gets five separate
+# verdicts: A entry (the bot's own XML entry rule), B statistics (outcomes of the bot's own entry
+# ticks, settled on the correct tick), C economics (live Deriv quote at the bot's real stake ->
+# expected value), D risk (can the bot's recovery sequence be executed), E decision.
+evaluation:
+  long_window_ticks: 100000      # long window for B and C (about 1.2 days at 1 tick/s, 2.3 days at 2 s)
+  confidence: 0.99               # Wilson interval level (two-sided for B, one-sided bounds for C)
+  min_outcomes: 100              # fewer settled entries than this -> NOT_CHECKED
+  entry_gap_ticks: 1             # contract entry = the tick after the trigger tick (DBot timing)
+  # gates required for START; 'risk' is mandatory. Default: entry + statistics + economics + risk.
+  # With fair digits economics is never POSITIVE (Deriv's commission), so the default sends no START.
+  start_requires: [entry, statistics, economics, risk]
+
+# Live payout quotes (public proposal calls, no token, nothing bought), rate-limited by
+# deriv.rate_limit_proposal_per_min. A quote older than max_quote_age_hours counts as missing.
+economics:
+  currency: USD
+  refresh_hours: 6
+  max_quote_age_hours: 24
+  retry_seconds: 60
+
+# Recovery / risk check of every bot's own stake ladder.
+risk:
+  bankroll_usd: null             # balance available to a bot (USD). null = UNKNOWN -> no START
+  bankroll_per_bot: {}           # e.g. {aria: 500, delta: 100}
+  base_stakes: {}                # your Base Stake if you changed it in DBot, e.g. {predator: 2}
+  max_payout_override: null      # your account's maximum payout if a demo quote shows a different one
+  min_stake_override: null
+  max_ladder_steps: 60
 
 signals:
   start_confirm_cycles: 3        # consecutive passing checks (rule met) before START
