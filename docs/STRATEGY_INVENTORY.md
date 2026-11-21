@@ -1,9 +1,20 @@
 # Phase A — Strategy inventory (10 DBot XML files)
 
-> **Signal rule changed on 2026-11-17.** The win-rate / break-even / confidence-bound / FDR /
-> out-of-sample gates and payout quotes described below were removed. A bot × market now
-> passes only when every winning digit of the bot's contracts is above 10 % of the last 500
-> ticks (README → "How it works"). This file is kept as a record of the earlier checks.
+> **Evaluation model replaced on 2026-11-20 (strategy alignment).** The analyzer now evaluates
+> each bot from an XML-faithful strategy model, `app/strategy_model/bots.py`: entry rule,
+> contracts, settlement tick, the exact stake ladder (DBot `toFixed(2)` rounding), take-profit,
+> stop-loss and stop / reset conditions, cross-checked against `strategies/*.yaml` at start-up.
+> Each bot × market gets separate entry, statistics, economics (live quote → EV) and risk
+> (payout cap, minimum stake, bankroll) verdicts; the 10 % digit rule of 2026-11-17 is kept as
+> information only (README → "How it works"). The stake / stop table below predates that model
+> and the $1,000 maximum payout; where they differ the model is right:
+> Aria's 8-loss streak is −342.92 (not −342.94), Delta's 6th loss −81.13 (not −81.05); Predator
+> stops at the 7th stake (729: payout above 1,000, refused) at −364, Predator v2 at its 9th stake
+> (512) at −510 before its reset can trigger, Navix at its 7th stake (1,102.96) at −440.95,
+> Pulse2 at its 11th stake (983.34) at −935.80 before its 3,000 stop-loss, and Crysis at stake
+> 1,142.1 (first streak of a run, Initial Y = 2) at −569.05. Zony AI stops after 6 losses
+> (its prediction list has no 7th entry). The YAML files were not changed. This file is kept as
+> a record of the earlier checks.
 
 Each bot was re-read from its XML (Blockly) file and reconciled against the Phase 1 audit
 report. The machine-readable version is `strategies/<bot>.yaml`; the analyzer uses only those

@@ -17,9 +17,12 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from app import __version__
-from app.analytics.analyzer import Analyzer, EvalResult, SeriesCache
-from app.analytics.validation import RuleConfig
+from app.analytics.analyzer import SeriesCache
+from app.analytics.validation import RUN, RuleConfig
 from app.config import Settings, load_settings
+from app.economics.quotes import QuoteBook, QuoteService
+from app.strategy_model.bots import load_models
+from app.strategy_model.evaluate import EvalConfig, StrategyAnalyzer, StrategyEvalResult
 from app.deriv.client import DerivAPIError, DerivClient, NotConnectedError
 from app.deriv.contracts import fetch_contracts
 from app.deriv.symbols import MarketInfo, classify_market, fetch_active_symbols, select_candidates
@@ -29,14 +32,13 @@ from app.market.health import HealthMonitor
 from app.market.processor import TickProcessor
 from app.monitoring.heartbeat import write_heartbeat
 from app.monitoring.logger import event, setup_logging
-from app.signals.engine import SignalEngine
+from app.signals.engine import SignalEngine, StartLimit
 from app.signals.state import SignalStateStore
 from app.signals.telegram import MessageFormatter, TelegramSender, enqueue
 from app.storage import repositories as repo
 from app.storage.database import init_db, transaction, write_stats
 from app.strategies.compatibility import CompatResult, build_matrix
 from app.strategies.loader import load_strategies
-from app.strategies.triggers import describe_trigger
 
 log = logging.getLogger("app")
 
@@ -48,6 +50,8 @@ class Application:
         self.conn = init_db(self.db_path)
         self.bots = load_strategies(settings.path(settings.strategies.dir), list(settings.strategies.enabled))
         self.bot_map = {b.key: b for b in self.bots}
+        # bot-specific strategy model, cross-checked against strategies/*.yaml (refuses to start on mismatch)
+        self.models = load_models(self.bots)
         dq, an, dv = settings.data_quality, settings.analysis, settings.deriv
         self.health = HealthMonitor(stale_factor=float(dq.stale_factor), critical_stale_s=float(dq.critical_stale_s),
                                     critical_disconnect_s=float(dq.critical_disconnect_s))
@@ -58,17 +62,29 @@ class Application:
             general_per_min=float(dv.rate_limit_general_per_min),
             proposal_per_min=float(dv.rate_limit_proposal_per_min))
         self.processor = TickProcessor(self.conn, self.health, missing_factor=float(dq.missing_factor))
-        self.rule = RuleConfig.from_settings(settings.signal_rule)
-        self.cache = SeriesCache(self.db_path, self.rule.window_ticks)
+        self.rule = RuleConfig.from_settings(settings.signal_rule)        # legacy rule (informational)
+        self.eval_cfg = EvalConfig.from_settings(settings)
+        self.cache = SeriesCache(self.db_path, self.eval_cfg.long_window_ticks)
         self.processor.on_out_of_order = self.cache.mark_dirty
         self.collector = Collector(self.client, self.conn, self.processor, self.health, settings.collection,
                                    on_history_inserted=self.cache.mark_history)
         self.client.on_tick = self.processor.on_tick
         self.client.add_connect_hook(self.collector.on_connect)
         self.client.add_disconnect_hook(self.collector.on_disconnect)
-        self.analyzer = Analyzer(self.bots, self.cache, self.rule)
+        self.quote_book = QuoteBook(self.conn)
+        self.quote_book.load()
+        self.analyzer = StrategyAnalyzer(self.bot_map, self.models, self.cache, self.eval_cfg, self.quote_book,
+                                         settings.risk)
+        ec = settings.economics
+        self.quote_service = QuoteService(self.client, self.quote_book, self._quote_needs,
+                                          refresh_s=float(ec.refresh_hours) * 3600, retry_s=float(ec.retry_seconds),
+                                          currency=str(ec.currency))
+        self.history_tuples = repo.load_last_history(self.conn)
         tg = settings.telegram
-        self.formatter = MessageFormatter(self.bot_map, str(tg.timezone), int(an.risk_streak))
+        sg = settings.signals
+        self.formatter = MessageFormatter(self.bot_map, str(tg.timezone), int(an.risk_streak),
+                                          cooldown_minutes=float(sg.restart_cooldown_minutes),
+                                          start_confirm_cycles=int(sg.start_confirm_cycles))
         self.store = SignalStateStore(self.conn)
         self.engine = SignalEngine(self.conn, self.store, self.formatter, settings.signals)
         self.sender = TelegramSender(self.conn, settings.telegram_token, settings.telegram_chat_id,
@@ -80,8 +96,8 @@ class Application:
         self.contracts: dict = {}
         self.matrix: dict[tuple[str, str], CompatResult] = {}
         self.discovery_done = asyncio.Event()
-        self.last_eval: EvalResult | None = None
-        self.last_status: dict[tuple[str, str], tuple] = {}     # (status, per-contract results)
+        self.last_eval: StrategyEvalResult | None = None
+        self.last_status: dict[tuple[str, str], tuple] = {}     # (decision, entry, statistics, economics, risk)
         self._error_alerts: dict[str, float] = {}
         self._tasks: list[asyncio.Task] = []
         self.started_at = time.time()
@@ -198,7 +214,12 @@ class Application:
                 missing[key] = "market no longer compatible / monitored"
         return sorted(combos), missing
 
-    async def evaluate_once(self) -> EvalResult:
+    def _quote_needs(self):
+        """Exact-stake quotes the evaluation needs (read by the quote service every iteration)."""
+        combos, _ = self.combos()
+        return self.analyzer.quote_needs(combos)
+
+    async def evaluate_once(self) -> StrategyEvalResult:
         now = time.time()
         combos, missing = self.combos()
         live = {sym: self.health.status(sym, now) for sym in self.markets}
@@ -208,33 +229,36 @@ class Application:
             self.health.set_nominal(sym, q.nominal_interval)
         save_error: Exception | None = None
         try:
-            repo.save_evaluations(self.conn, [(v.bot, v.symbol, v.status, v.summary())
-                                              for v in result.verdicts.values()],
-                                  [(v.bot, v.symbol, v.status, c) for v in result.verdicts.values()
-                                   for c in v.contracts])
+            self.history_tuples = repo.save_strategy_cycle(self.conn, list(result.verdicts.values()),
+                                                           self.history_tuples)
         except Exception as exc:
-            # Rolled back by save_evaluations (previous cycle's results stay intact). The cycle still
-            # runs the STOP rules below, but gives no START credit (starts_allowed=False).
+            # Rolled back by save_strategy_cycle (previous cycle's results stay intact, history_tuples
+            # keeps its old value). The cycle still runs the STOP rules below, but gives no START
+            # credit (starts_allowed=False).
             save_error = exc
             self.eval_failures_consecutive += 1
-            self.last_eval_error = f"save_evaluations: {type(exc).__name__}: {exc}"[:300]
+            self.last_eval_error = f"save_strategy_cycle: {type(exc).__name__}: {exc}"[:300]
             event(log, "evaluation_save_failed", logging.ERROR, error=f"{type(exc).__name__}: {exc}"[:300],
                   consecutive=self.eval_failures_consecutive, starts_allowed=False)
         for key, v in result.verdicts.items():
-            # logged when the bot's status or any contract's PASS / FAIL result changes
-            state = (v.status, tuple(c.result for c in v.contracts))
+            # logged when the decision or any of the four gate statuses changes
+            state = v.status_tuple()
             prev = self.last_status.get(key)
             if prev != state:
-                event(log, "rule_" + ("passed" if v.status == "RUN_CANDIDATE" else "status"), logging.INFO,
+                event(log, "verdict_" + ("run_candidate" if v.status == RUN else "status"), logging.INFO,
                       bot=v.bot, symbol=v.symbol, status=v.status, previous=(prev[0] if prev else None),
-                      contracts_passing=f"{len(v.passing_contracts)}/{len(v.contracts)}",
-                      contracts=v.contracts_text(), reason=" | ".join(v.reasons))
+                      gates=v.gates_text(), reason=" | ".join(v.reasons)[:600])
                 self.last_status[key] = state
         self.engine.process(result.verdicts, now, missing, starts_allowed=save_error is None)
         self.last_eval = result
         slow = result.duration_s > float(self.s.analysis.interval_s)
+        counts: dict[str, int] = {}
+        for v in result.verdicts.values():
+            counts[v.status] = counts.get(v.status, 0) + 1
         event(log, "evaluation_slow" if slow else "evaluation_cycle", logging.WARNING if slow else logging.INFO,
-              combos=len(combos), checks=result.tests, contract_checks=result.contract_checks,
+              combos=len(combos), checks=result.tests,
+              legs=sum(len(v.legs) for v in result.verdicts.values()),
+              decisions=",".join(f"{k}:{n}" for k, n in sorted(counts.items())),
               seconds=round(result.duration_s, 2))
         if save_error is not None:
             await self.system_error("evaluation_save", save_error)
@@ -258,6 +282,8 @@ class Application:
                 self.eval_failures_consecutive += 1
                 self.last_eval_error = f"{type(exc).__name__}: {exc}"[:300]
                 log.exception("event=evaluation_failed consecutive=%d", self.eval_failures_consecutive)
+                # no verdicts this cycle: it breaks every START confirmation run (active signals untouched)
+                self.engine.discard_start_credit(time.time(), f"evaluation failed: {type(exc).__name__}")
                 await self.system_error("evaluation", exc)
             await asyncio.sleep(max(1.0, interval - (time.monotonic() - t0)))
 
@@ -380,10 +406,16 @@ class Application:
         """What the heartbeat file publishes (read by scripts/healthcheck.py and status tools)."""
         last_tick = max((h.last_wall or 0) for h in self.health.symbols.values()) if self.health.symbols else 0
         st_counts: dict[str, int] = {}
+        gate_counts: dict[str, dict[str, int]] = {"entry": {}, "statistics": {}, "economics": {}, "risk": {}}
         if self.last_eval:
             for v in self.last_eval.verdicts.values():
                 st_counts[v.status] = st_counts.get(v.status, 0) + 1
+                for g, d in gate_counts.items():
+                    s = v.gates.get(g, {}).get("status", "?")
+                    d[s] = d.get(s, 0) + 1
         return {
+            "gate_counts": gate_counts,
+            "quotes": {**self.quote_service.stats, "stored": len(self.quote_book.quotes)},
             "version": __version__, "connected": self.client.connected,
             "monitored_symbols": sorted(self.markets), "last_tick_wall": int(last_tick),
             "bootstrap_done": sorted(self.collector.bootstrap_done),
@@ -478,6 +510,7 @@ class Application:
             except (NotImplementedError, RuntimeError):  # Windows
                 pass
         coros = [self.client.run(), self.discovery_loop(), self.evaluation_loop(),
+                 self.quote_service.loop(self.discovery_done),
                  self.collector.flush_loop(float(self.s.collection.flush_interval_s)),
                  self.collector.backfill_worker(), self.gap_audit_loop(), self.health_loop(),
                  self.notifier_loop(), self.heartbeat_loop(), self.retention_loop(), self.daily_summary_loop()]
@@ -521,17 +554,45 @@ class Application:
 
 
 def print_inventory(settings: Settings) -> None:
+    """--validate: load the strategies, cross-check them against the XML strategy model (refuses on any
+    mismatch) and print every bot's contracts, entry rules and losing-streak stake ladder."""
     bots = load_strategies(settings.path(settings.strategies.dir), list(settings.strategies.enabled))
-    from app.analytics.risk import risk_lines
+    models = load_models(bots)
+    cfg = EvalConfig.from_settings(settings)
+    rs = settings.risk
+    steps = int(rs.max_ladder_steps)
     for b in bots:
-        print(f"\n== {b.name} ({b.source_file}) original symbol {b.original.get('symbol')}")
-        for leg in b.legs:
-            print(f"   leg {leg.id:<10} {leg.label:<14} {leg.duration_ticks}t  p0={leg.p0:.0%}  "
-                  f"trigger: {leg.trigger_text or describe_trigger(leg.trigger)}")
-        print(f"   sequence: {b.sequence}")
-        for r in risk_lines(b, int(settings.analysis.risk_streak)):
-            print(f"   risk: {r}")
-    print(f"\n{len(bots)} bots, {sum(len(b.legs) for b in bots)} legs loaded")
+        m = models[b.key]
+        base = (rs.base_stakes or {}).get(b.key)
+        base = m.default_base_stake if base is None else float(base)
+        print(f"\n== {m.name} ({m.xml_file}) original symbol {m.default_symbol}, base stake {base:g}")
+        for leg in m.legs:
+            print(f"   leg {leg.id:<10} {leg.label:<16} wins on last digit {list(leg.win_digits)} "
+                  f"(fair {leg.p_fair:.0%}); used: {leg.used_when}")
+            print(f"       entry: {leg.entry.text}  [{leg.entry.evidence}]")
+        print(f"   take profit: {m.take_profit_rule}")
+        print(f"   stop loss:   {m.stop_loss_rule}")
+        print(f"   recovery:    {m.recovery_text}")
+        for lad in m.ladders(base, steps):
+            stakes = ", ".join(f"{s.amount:g}" for s in lad.steps[:10])
+            more = f", ... ({len(lad.steps)} trades)" if len(lad.steps) > 10 else ""
+            own = (f"the bot's own rule ends the streak after {lad.xml_stop_after} losses ({lad.xml_stop_text})"
+                   if lad.xml_stop_after is not None else f"no own stop within {len(lad.steps)} losses")
+            print(f"   losing streak [{lad.variant}]: stakes {stakes}{more}; {own}")
+    print(f"\n{len(bots)} bots, {sum(len(models[b.key].legs) for b in bots)} legs loaded; the strategy model "
+          f"matches strategies/*.yaml")
+    rule = RuleConfig.from_settings(settings.signal_rule)
+    sg = settings.signals
+    bank = rs.bankroll_usd
+    print(f"evaluation: START requires {', '.join(cfg.start_requires)}; recent window {cfg.window_ticks:,} ticks, "
+          f"long window {cfg.long_window_ticks:,} ticks, confidence {cfg.confidence:.0%}, at least "
+          f"{cfg.min_outcomes} settled entries; bankroll "
+          f"{'not configured (risk UNKNOWN -> no START)' if bank is None else f'{float(bank):,.2f}'}")
+    print(f"legacy digit rule (shown for information only, gates nothing): every winning digit > "
+          f"{rule.threshold_text} of the last {rule.window_ticks} ticks")
+    print(f"signals: START after {int(sg.start_confirm_cycles)} checks, STOP after {int(sg.stop_confirm_cycles)} "
+          f"(critical contract / feed / risk faults: immediately), cooldown "
+          f"{float(sg.restart_cooldown_minutes):g} min (START only); {StartLimit.from_settings(sg).text()}")
 
 
 def main(argv: list[str] | None = None) -> int:

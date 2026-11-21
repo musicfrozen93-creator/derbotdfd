@@ -62,9 +62,30 @@ DEFAULTS: dict[str, Any] = {
     },
     "signal_rule": {
         "mode": "individual",
-        "threshold_pct": 10,
-        "window_ticks": 500,
+        "threshold_pct": 10,        # legacy digit rule, now shown for information only
+        "window_ticks": 500,        # recent window (statistics, legacy rule, minimum data)
         "contracts": "all",
+    },
+    "evaluation": {
+        "long_window_ticks": 100000,
+        "confidence": 0.99,
+        "min_outcomes": 100,
+        "entry_gap_ticks": 1,
+        "start_requires": ["entry", "statistics", "economics", "risk"],
+    },
+    "economics": {
+        "currency": "USD",
+        "refresh_hours": 6,
+        "max_quote_age_hours": 24,
+        "retry_seconds": 60,
+    },
+    "risk": {
+        "bankroll_usd": None,
+        "bankroll_per_bot": {},
+        "base_stakes": {},
+        "max_payout_override": None,
+        "min_stake_override": None,
+        "max_ladder_steps": 60,
     },
     "signals": {
         "start_confirm_cycles": 3,
@@ -72,6 +93,8 @@ DEFAULTS: dict[str, Any] = {
         "restart_cooldown_minutes": 30,
         "startup_grace_s": 300,
         "offline_stop_s": 120,
+        "max_starts_per_bot": 5,
+        "start_limit_window_hours": 12,
     },
     "telegram": {
         "enabled": True,

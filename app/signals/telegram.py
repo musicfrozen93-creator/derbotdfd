@@ -2,6 +2,11 @@
 
 Messages are plain text (no parse_mode), so no Markdown/HTML escaping issues.
 The bot token is only used to build the request URL and is never logged.
+
+START / STOP messages are built from a :class:`~app.strategy_model.evaluate.StrategyVerdict` (the
+bot-specific evaluation: entry, statistics, payout / expected value, risk). The older
+:class:`~app.analytics.validation.BotVerdict` (legacy digit-frequency rule) is still formatted the
+old way, so stored or test verdicts of that type keep working.
 """
 from __future__ import annotations
 
@@ -22,11 +27,17 @@ from app.analytics.validation import (FAIL, PASS, UNAVAILABLE, BotVerdict, Contr
 from app.monitoring.logger import event
 from app.storage.database import transaction
 from app.strategies.loader import BotSpec
+from app.strategy_model.bots import win_digits
+from app.strategy_model.evaluate import StrategyVerdict
 
 log = logging.getLogger("signals.telegram")
 
 API = "https://api.telegram.org/bot{token}/sendMessage"
 MAX_LEN = 4000
+GATE_NAMES = {"entry": "Entry condition", "statistics": "Contract statistics", "economics": "Payout / expected value",
+              "risk": "Risk"}
+DISCLAIMER = ("This is not a prediction that the bot will win. Win rates describe past ticks only; they are not a "
+              "guaranteed future probability, and the bot's recovery sequence can still lose the amounts shown.")
 
 
 def _pct(x) -> str:
@@ -37,12 +48,33 @@ def _n(x) -> str:
     return f"{int(x):,}"
 
 
+def _cut(text: str, n: int = 350) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def _digit_set(ds) -> str:
+    """0,1,2,3,6 -> '0-3, 6'."""
+    ds = sorted(ds)
+    out, i = [], 0
+    while i < len(ds):
+        j = i
+        while j + 1 < len(ds) and ds[j + 1] == ds[j] + 1:
+            j += 1
+        out.append(str(ds[i]) if j == i else f"{ds[i]}-{ds[j]}" if j > i + 1 else f"{ds[i]}, {ds[j]}")
+        i = j + 1
+    return ", ".join(out) if out else "none"
+
+
 class MessageFormatter:
-    def __init__(self, bots: dict[str, BotSpec], tz_name: str = "Asia/Colombo", risk_streak: int = 6) -> None:
+    def __init__(self, bots: dict[str, BotSpec], tz_name: str = "Asia/Colombo", risk_streak: int = 6, *,
+                 cooldown_minutes: float = 30, start_confirm_cycles: int = 3) -> None:
         self.bots = bots
         self.tz = ZoneInfo(tz_name)
         self.tz_name = tz_name
         self.risk_streak = risk_streak
+        self.cooldown_minutes = float(cooldown_minutes)
+        self.start_confirm_cycles = int(start_confirm_cycles)
 
     def ts(self, now: float) -> str:
         utc = datetime.fromtimestamp(now, tz=timezone.utc)
@@ -104,7 +136,140 @@ class MessageFormatter:
         lines += [f"• {r}" for r in risk_lines(bot, self.risk_streak)]
         return lines
 
-    def start(self, v: BotVerdict, now: float) -> str:
+    # ------------------------------------------------------------ bot-specific (StrategyVerdict)
+    @staticmethod
+    def _leg_head(lg) -> str:
+        pred = "no prediction" if lg.barrier is None else f"prediction {lg.barrier}"
+        dur = f"{lg.duration} tick{'s' if lg.duration != 1 else ''}"
+        return f"{lg.contract_type}, {pred}, {dur}"
+
+    def _strategy_leg_lines(self, v: StrategyVerdict) -> list[str]:
+        conf = f"{v.confidence:.0%} " if v.confidence else ""
+        lines = []
+        for i, lg in enumerate(v.legs):
+            lines.append(f"• {lg.leg_id}: {self._leg_head(lg)}")
+            lines.append(f"  Wins if the settlement tick's last digit is {_digit_set(win_digits(lg.contract_type, lg.barrier))}"
+                         f" (fair chance {len(win_digits(lg.contract_type, lg.barrier)) / 10:.0%}); used: {lg.used_when}")
+            if i == 0 and v.entry is not None:
+                lines.append(f"  Entry condition ({v.entry.rule}): {v.entry.status} — {_cut(v.entry.detail, 200)}")
+            else:
+                lines.append(f"  Entry condition ({lg.entry_rule}): applies while the bot is in this mode; the analyzer "
+                             f"cannot see the bot's live mode, so it is not checked separately")
+            st = lg.long
+            if st is not None and st.settled:
+                lines.append(f"  Statistics (this bot's own entries, last {st.window_ticks:,} ticks): {st.wins:,} of "
+                             f"{st.settled:,} won = {st.win_rate:.2%} ({conf}CI {st.ci_low:.2%}-{st.ci_high:.2%}) "
+                             f"— {lg.statistics_status}")
+            else:
+                lines.append(f"  Statistics: {lg.statistics_status} — {_cut(lg.statistics_detail, 160)}")
+            e = lg.economics
+            if e is None or e.payout is None:
+                lines.append("  Quoted payout: not available — " + _cut(e.detail if e else "no quote", 200)
+                             + " → expected value UNKNOWN")
+            else:
+                lines.append(f"  Quoted payout: {e.payout:,.2f} for stake {e.stake:,.2f} (net win +{e.net_win:,.2f}, "
+                             f"net loss -{e.net_loss:,.2f}, break-even win rate {e.break_even:.2%})")
+                if e.ev_hat is None:
+                    lines.append(f"  Expected value: {e.status} — {_cut(e.detail, 160)}")
+                else:
+                    lines.append(f"  Expected value per trade: {e.ev_hat:+.4f} (range {e.ev_low:+.4f} to "
+                                 f"{e.ev_high:+.4f}) — {e.status}")
+        return lines
+
+    def _gates_line(self, v: StrategyVerdict) -> str:
+        parts = []
+        for k, g in v.gates.items():
+            mark = "✅" if g["pass"] else ("❌" if g.get("required") else "⚪")
+            parts.append(f"{GATE_NAMES.get(k, k)} {g['status']} {mark}")
+        return "Checks: " + " · ".join(parts)
+
+    def _strategy_risk_lines(self, v: StrategyVerdict) -> list[str]:
+        r = v.risk
+        if r is None:
+            return ["Risk: UNKNOWN — not evaluated"]
+        lines = [f"Risk: {r.status} — {_cut(r.reason, 300)}"]
+        nxt = f"{r.next_payout:,.2f}" if r.next_payout is not None else "no quote"
+        lines.append(f"• Next trade: {r.next_contract} at stake {r.next_stake:,.2f} (quoted payout {nxt})")
+        fresh = r.ladders[0] if r.ladders else None
+        if fresh is not None and len(fresh.steps) > 1:
+            s1 = fresh.steps[1]
+            lines.append(f"• Next stake after a loss: {s1.stake:,.2f} ({s1.contract}); loss so far "
+                         f"-{s1.cum_loss_before:,.2f}")
+        if r.max_losses_before_stop is not None:
+            lines.append(f"• Longest losing streak before the bot stops: {r.max_losses_before_stop} losses; that streak "
+                         f"can lose up to {r.worst_loss:,.2f}")
+        if r.required_bankroll is not None:
+            have = "not configured" if r.bankroll is None else f"{r.bankroll:,.2f}"
+            lines.append(f"• Bankroll needed for that streak: {r.required_bankroll:,.2f} (configured: {have})")
+        lines.append("• After a refused contract the bot cannot continue (DBot treats it as an unrecoverable error).")
+        return lines
+
+    def _start_strategy(self, v: StrategyVerdict, now: float) -> str:
+        bot = self.bots[v.bot]
+        lines = ["🟢 START SIGNAL", "", f"Bot: {bot.name}", f"Market: {v.symbol_name}", f"Symbol: {v.symbol}", "",
+                 f"Contract{'s' if len(v.legs) > 1 else ''} (from {bot.source_file}):"]
+        lines += self._strategy_leg_lines(v)
+        lines += ["", self._gates_line(v), ""]
+        lines += self._strategy_risk_lines(v)
+        req = ", ".join(k for k, g in v.gates.items() if g.get("required"))
+        lines += ["", f"Reason for START: every required check ({req}) passed on {self.start_confirm_cycles} "
+                      f"consecutive evaluations.", "", f"Time: {self.ts(now)}", "",
+                  f"ACTION: You may consider running {bot.name} on {v.symbol}.", "", DISCLAIMER]
+        return "\n".join(lines)[:MAX_LEN]
+
+    def _cooldown_line(self, bot_name: str, symbol: str, now: float) -> str:
+        if self.cooldown_minutes <= 0:
+            return "Cooldown: none configured (signals.restart_cooldown_minutes = 0)."
+        until = datetime.fromtimestamp(now + self.cooldown_minutes * 60, tz=timezone.utc).astimezone(self.tz)
+        return (f"Cooldown: applies — no new START for {bot_name} on {symbol} before {until:%Y-%m-%d %H:%M} "
+                f"({self.tz_name}), {self.cooldown_minutes:g} min, and then only after {self.start_confirm_cycles} "
+                f"consecutive passing checks. The cooldown and the START limit never delay a STOP.")
+
+    def _stop_strategy(self, v: StrategyVerdict, now: float, critical: bool) -> str:
+        bot = self.bots[v.bot]
+        lines = ["🔴 STOP SIGNAL" + (" (critical)" if critical else ""), "",
+                 f"Bot: {bot.name}", f"Market: {v.symbol_name}", f"Symbol: {v.symbol}", "",
+                 "Reason for STOP: " + _cut("; ".join(v.reasons[:3]) or v.status, 600)]
+        failed = [(k, g) for k, g in v.gates.items() if not g["pass"]]
+        if failed:
+            lines.append("Checks not passing:")
+            for k, g in failed:
+                note = "" if g.get("required") else " (not required for START)"
+                lines.append(f"• {GATE_NAMES.get(k, k)}: {g['status']}{note} — {_cut(g['detail'], 300)}")
+        if not v.compatible:
+            lines.append(f"• Contract availability: UNAVAILABLE — {_cut(v.compat_text, 300)}")
+        q = v.quality
+        if q is not None and q.status != "CLEAN":
+            lines.append(f"• Live feed: {q.status} — {_cut(q.detail, 200)}")
+        pay = []
+        for lg in v.legs:
+            e = lg.economics
+            if e is None or e.payout is None:
+                pay.append(f"{lg.label}: no valid quote ({_cut(e.detail if e else 'no quote', 160)})")
+            elif e.status != "POSITIVE":
+                pay.append(f"{lg.label}: payout {e.payout:,.2f} for {e.stake:,.2f}, break-even {e.break_even:.2%}, "
+                           f"expected value {e.status}")
+        if pay:
+            lines.append("Payout issue: " + "; ".join(pay))
+        if v.risk is not None and v.risk_status != "SAFE":
+            lines.append(f"Risk issue: {v.risk_status} — {_cut(v.risk.reason, 400)}")
+        lines += ["", self._cooldown_line(bot.name, v.symbol, now), "",
+                  f"ACTION: Stop running {bot.name} on {v.symbol}.", "", f"Time: {self.ts(now)}"]
+        return "\n".join(lines)[:MAX_LEN]
+
+    # ------------------------------------------------------------------ dispatch
+    def start(self, v, now: float) -> str:
+        if isinstance(v, StrategyVerdict):
+            return self._start_strategy(v, now)
+        return self._start_legacy(v, now)
+
+    def stop(self, v, now: float, critical: bool = False) -> str:
+        if isinstance(v, StrategyVerdict):
+            return self._stop_strategy(v, now, critical)
+        return self._stop_legacy(v, now, critical)
+
+    # ------------------------------------------------------------ legacy digit rule (BotVerdict)
+    def _start_legacy(self, v: BotVerdict, now: float) -> str:
         bot = self.bots[v.bot]
         total = len(v.contracts)
         lines = ["🟢 START SIGNAL", "",
@@ -120,7 +285,7 @@ class MessageFormatter:
                   "martingale risk."]
         return "\n".join(lines)[:MAX_LEN]
 
-    def stop(self, v: BotVerdict, now: float, critical: bool = False) -> str:
+    def _stop_legacy(self, v: BotVerdict, now: float, critical: bool = False) -> str:
         bot = self.bots[v.bot]
         total = len(v.contracts)
         thr = f"{v.threshold_pct:g}%"
@@ -152,9 +317,10 @@ class MessageFormatter:
         name = bot.name if bot else bot_key
         lines = ["🔴 STOP SIGNAL (critical)", "", f"Bot: {name}", f"Symbol: {symbol}", "",
                  f"Signal status: STOP — {reason}",
-                 "• The digit percentages could not be checked for this combination.", "",
+                 "• The bot's conditions (entry, statistics, payout, risk) could not be checked for this "
+                 "combination.", "", self._cooldown_line(name, symbol, now), "",
                  f"ACTION: Stop running {name} on {symbol}.", "", f"Time: {self.ts(now)}"]
-        return "\n".join(lines)
+        return "\n".join(lines)[:MAX_LEN]
 
     def critical(self, title: str, detail: str, now: float, affected: list[str] | None = None) -> str:
         lines = [f"⚠️ CRITICAL: {title}", "", detail]

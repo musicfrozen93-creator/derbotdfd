@@ -17,7 +17,8 @@ from app.monitoring.logger import event
 
 log = logging.getLogger("storage.db")
 
-SCHEMA_VERSION = 2   # 2: contract_results (per-contract PASS / FAIL)
+SCHEMA_VERSION = 4   # 2: contract_results (per-contract PASS / FAIL); 3: signal_start_ledger;
+                     # 4: quotes, platform limits, strategy evaluations, history (app/storage/migrations.py)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ticks (
@@ -70,6 +71,15 @@ CREATE TABLE IF NOT EXISTS signal_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     bot TEXT, symbol TEXT, kind TEXT, reason TEXT, created_at INTEGER, details TEXT
 );
+
+-- one row per START that was actually issued (written in the same transaction as the START);
+-- the per-bot rolling START limit counts these rows. The primary key makes a second row for the
+-- same START impossible, so a START can never be counted twice.
+CREATE TABLE IF NOT EXISTS signal_start_ledger (
+    bot TEXT NOT NULL, symbol TEXT NOT NULL, started_at INTEGER NOT NULL,
+    PRIMARY KEY (bot, symbol, started_at)
+);
+CREATE INDEX IF NOT EXISTS idx_start_ledger_bot ON signal_start_ledger(bot, started_at);
 
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -207,8 +217,31 @@ def connect(path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
     return conn
 
 
-def init_db(path: str | Path) -> sqlite3.Connection:
+def stored_schema_version(conn) -> int | None:
+    """Schema version recorded in ``meta`` (None for a new database)."""
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    except sqlite3.OperationalError:          # no meta table yet
+        return None
+    return int(row[0]) if row and str(row[0]).isdigit() else None
+
+
+def init_db(path: str | Path, *, migrate_to: int | None = None) -> sqlite3.Connection:
+    """Create / upgrade the schema. Every change is additive (CREATE ... IF NOT EXISTS).
+
+    Upgrade to v3: the new ``signal_start_ledger`` is filled from the START rows already in
+    ``signal_events``, so STARTs sent before the upgrade still count toward the rolling limit.
+    v4 and later: versioned up / down migrations in :mod:`app.storage.migrations`."""
+    from app.storage.migrations import BASE_VERSION, migrate
     conn = connect(path)
+    previous = stored_schema_version(conn)
     conn.executescript(SCHEMA)
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+    with transaction(conn, "init_db.migrate"):
+        if previous is not None and previous < 3:
+            conn.execute("INSERT OR IGNORE INTO signal_start_ledger(bot, symbol, started_at)"
+                         " SELECT bot, symbol, created_at FROM signal_events"
+                         " WHERE kind='START' AND bot IS NOT NULL AND symbol IS NOT NULL AND created_at IS NOT NULL")
+        if previous is None or previous < BASE_VERSION:
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)", (str(BASE_VERSION),))
+    migrate(conn, migrate_to)
     return conn

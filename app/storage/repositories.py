@@ -177,6 +177,86 @@ def save_evaluations(conn, rows: list[tuple[str, str, str, dict]], contract_rows
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", result_rows)
 
 
+def save_strategy_cycle(conn, verdicts: list, last_tuples: dict) -> dict:
+    """Write one evaluation cycle of bot-specific verdicts (StrategyVerdict) atomically:
+
+    * ``evaluations`` (status + full summary JSON) and ``contract_results`` (the legacy digit rule per
+      leg, marked informational) - the tables older tools read;
+    * ``strategy_evaluations`` and ``leg_evaluations`` (latest per combination / leg);
+    * ``evaluation_history``: one row per combination whose (decision, entry, statistics, economics,
+      risk) tuple differs from ``last_tuples``.
+
+    All or nothing: on any error the previous cycle's rows stay and the exception propagates. Returns
+    the new tuple map; the caller adopts it only after this returns (so a failed write is retried)."""
+    ts = now_i()
+    eval_rows, legacy_rows, strat_rows, leg_rows, hist_rows = [], [], [], [], []
+    new_tuples = dict(last_tuples)
+    for v in verdicts:
+        eval_rows.append((v.bot, v.symbol, v.status, ts, json.dumps(v.summary(), default=str)))
+        reasons = json.dumps(v.reasons)
+        strat_rows.append((v.bot, v.symbol, v.status, v.entry_status, v.statistics_status, v.economics_status,
+                           v.risk_status, v.critical_kind, reasons, json.dumps(v.gates, default=str), ts))
+        tup = v.status_tuple()
+        if last_tuples.get((v.bot, v.symbol)) != tup:
+            hist_rows.append((v.bot, v.symbol, ts, *tup[:5], reasons))
+            new_tuples[(v.bot, v.symbol)] = tup
+        for lg in v.legs:
+            lr = lg.legacy_rule or {}
+            legacy_rows.append((v.bot, v.symbol, lg.leg_id, lg.contract_type, lg.barrier, lg.duration,
+                                f"{lg.contract_type}{'' if lg.barrier is None else ' ' + str(lg.barrier)}",
+                                ",".join(map(str, lr.get("winning_digits", []))),
+                                json.dumps(lr.get("digit_pct", {})), ",".join(map(str, lr.get("failing_digits", []))),
+                                lr.get("result", "NOT_CHECKED"), "legacy digit rule (informational, not a gate)",
+                                v.status, ts))
+            e, lo = lg.economics, lg.long
+            leg_rows.append((v.bot, v.symbol, lg.leg_id, lg.label, lg.used_when, f"{lg.stake:.2f}",
+                             lg.recent.triggers if lg.recent else None, lg.recent.settled if lg.recent else None,
+                             lg.recent.wins if lg.recent else None, lo.settled if lo else None,
+                             lo.wins if lo else None, lo.win_rate if lo else None, lo.ci_low if lo else None,
+                             lo.ci_high if lo else None, lo.p_fair if lo else None, lg.statistics_status,
+                             None if e is None or e.payout is None else f"{e.payout:.2f}",
+                             None if e is None else e.break_even, None if e is None else e.ev_fair,
+                             None if e is None else e.ev_low, None if e is None else e.ev_high,
+                             None if e is None else e.status, json.dumps(lr), ts))
+    with transaction(conn, "save_strategy_cycle"):
+        conn.execute("DELETE FROM evaluations")
+        conn.executemany("INSERT INTO evaluations(bot, symbol, status, evaluated_at, summary) VALUES (?,?,?,?,?)",
+                         eval_rows)
+        conn.execute("DELETE FROM contract_results")
+        conn.executemany(
+            "INSERT INTO contract_results(bot, symbol, leg_id, contract_type, barrier, duration, label,"
+            " winning_digits, digit_pct, failing_digits, result, detail, bot_status, evaluated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", legacy_rows)
+        conn.execute("DELETE FROM strategy_evaluations")
+        conn.executemany(
+            "INSERT INTO strategy_evaluations(bot, symbol, decision, entry_status, statistics_status, economics_status,"
+            " risk_status, critical_kind, reasons, detail, evaluated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", strat_rows)
+        conn.execute("DELETE FROM leg_evaluations")
+        conn.executemany(
+            "INSERT INTO leg_evaluations(bot, symbol, leg_id, contract, used_when, stake, triggers_recent,"
+            " settled_recent, wins_recent, settled_long, wins_long, win_rate_long, ci_low, ci_high, p_fair,"
+            " statistics_status, payout, break_even, ev_fair, ev_low, ev_high, economics_status, legacy_rule,"
+            " evaluated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", leg_rows)
+        conn.executemany(
+            "INSERT INTO evaluation_history(bot, symbol, evaluated_at, decision, entry_status, statistics_status,"
+            " economics_status, risk_status, reasons) VALUES (?,?,?,?,?,?,?,?,?)", hist_rows)
+    return new_tuples
+
+
+def load_last_history(conn) -> dict:
+    """Latest (decision, entry, statistics, economics, risk) per combination from evaluation_history."""
+    out = {}
+    try:
+        rows = conn.execute("SELECT h.* FROM evaluation_history h JOIN (SELECT bot, symbol, MAX(id) mid FROM"
+                            " evaluation_history GROUP BY bot, symbol) x ON h.id = x.mid").fetchall()
+    except sqlite3.OperationalError:
+        return out
+    for r in rows:
+        out[(r["bot"], r["symbol"])] = (r["decision"], r["entry_status"], r["statistics_status"],
+                                        r["economics_status"], r["risk_status"])
+    return out
+
+
 def load_contract_results(conn, bot: str | None = None, symbol: str | None = None) -> list:
     q = "SELECT * FROM contract_results WHERE 1=1"
     params: list = []
